@@ -381,6 +381,7 @@ class DouYinVideo(DouYinBaseUploader):
         productTitle="",
         thumbnail_portrait_path=None,
         desc: str | None = None,
+        location: str | None = None,
         publish_strategy: str = DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
@@ -400,6 +401,10 @@ class DouYinVideo(DouYinBaseUploader):
         self.productLink = productLink
         self.productTitle = productTitle
         self.desc = desc or ""
+        # P5: location flows from platform_payload through the runner.
+        # The base class's set_location() is now called from upload()
+        # below; an empty string is a no-op so passing "" is safe.
+        self.location = location or ""
 
     async def validate_upload_args(self):
         await self.validate_base_args()
@@ -529,6 +534,13 @@ class DouYinVideo(DouYinBaseUploader):
             douyin_logger.info(_msg("🛒", "小人正在设置商品链接"))
             await self.set_product_link(page, self.productLink, self.productTitle)
             douyin_logger.info(_msg("🥳", "商品链接设置完成"))
+
+        # P5 patch (vs upstream): wire location into the upload pipeline
+        # so dify-side `platform_payload.location` actually marks a POI
+        # rather than living as a desc footer.
+        if self.location:
+            douyin_logger.info(_msg("📍", f"小人正在设置位置：{self.location}"))
+            await self.set_location(page, self.location)
 
         await self.set_thumbnail(page)
 

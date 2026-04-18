@@ -424,6 +424,7 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         account_file,
         thumbnail_path=None,
         desc: str | None = None,
+        location: str | None = None,
         publish_strategy: str = XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
@@ -440,6 +441,10 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         self.tags = tags or []
         self.thumbnail_path = thumbnail_path
         self.desc = desc or ""
+        # P5: location flows from platform_payload through the runner.
+        # Upstream had `set_location` defined but commented out in
+        # upload_video_content — P5 wires it in for real.
+        self.location = location or ""
 
     async def validate_upload_args(self):
         await self.validate_base_args()
@@ -532,7 +537,13 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
 
         await self.set_thumbnail(page, self.thumbnail_path)
 
-        # await self.set_location(page, "青岛市")
+        # P5 patch (vs upstream): wire location into the upload pipeline.
+        # Upstream had this commented out with a hard-coded "青岛市"; we
+        # take the value from the constructor instead and skip cleanly
+        # when none was provided.
+        if self.location:
+            xiaohongshu_logger.info(_msg("📍", f"小人正在设置位置：{self.location}"))
+            await self.set_location(page, self.location)
 
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)

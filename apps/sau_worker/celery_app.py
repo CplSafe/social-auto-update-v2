@@ -12,7 +12,6 @@ app = Celery(
     include=[
         "apps.sau_worker.tasks.publish_douyin",
         "apps.sau_worker.tasks.publish_xhs",
-        "apps.sau_worker.tasks.publish_ks",
     ],
 )
 

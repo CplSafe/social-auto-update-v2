@@ -85,15 +85,15 @@ class TestLoginStubMode:
         assert (cookie_root / "tenant_tenant-xyz" / "douyin").exists()
 
     def test_rejects_unsupported_platform(self, client, auth_header):
-        # P4: ks scan-to-auth is not yet supported (no upstream cookie_gen).
-        # Should surface as a 400 with a helpful message rather than 500.
+        # P5: ks is no longer a member of the Platform Literal, so the
+        # pydantic validator rejects the request at the wire layer with
+        # 422 (a stronger guarantee than P4's 400 inside the handler).
         resp = client.post(
             "/login",
             headers=auth_header,
             json={"tenant_id": "t1", "platform": "ks", "session_id": "sid-bad"},
         )
-        assert resp.status_code == 400
-        assert "ks" in resp.json()["detail"]
+        assert resp.status_code == 422
 
     def test_xhs_login_supported_in_stub_mode(self, client, auth_header):
         # P4: xhs scan-to-auth must reach the QR-stub branch, not the

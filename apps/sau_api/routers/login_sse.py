@@ -59,14 +59,11 @@ class LoginRequest(BaseModel):
     sau_account_id: str | None = None
 
 
-# P4: scan-to-auth coverage by platform. KS uploader doesn't expose a
-# `*_cookie_gen` function in upstream yet, so we surface that gap as a
-# typed 400 instead of a confusing 500. When upstream catches up the
-# entry just gets added here.
+# P4 → P5: KS removed entirely (no upstream cookie_gen). The lookup table
+# stays around so adding a new platform is one line, not a refactor.
 _PLATFORM_LOGIN_SUPPORT: dict[str, tuple[str, str] | None] = {
     "douyin": ("uploader.douyin_uploader.main", "douyin_cookie_gen"),
     "xhs": ("uploader.xiaohongshu_uploader.main", "xiaohongshu_cookie_gen"),
-    "ks": None,
 }
 
 

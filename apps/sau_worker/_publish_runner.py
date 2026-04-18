@@ -30,7 +30,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-PlatformName = Literal["douyin", "xhs", "ks"]
+PlatformName = Literal["douyin", "xhs"]
 
 
 # ---------- platform-agnostic helpers ----------
@@ -45,7 +45,7 @@ def resolve_cookie_path(
         raise ValueError("invalid tenant_id")
     if not sau_account_id or "/" in sau_account_id or ".." in sau_account_id:
         raise ValueError("invalid sau_account_id")
-    if platform not in ("douyin", "xhs", "ks"):
+    if platform not in ("douyin", "xhs"):
         raise ValueError(f"invalid platform {platform!r}")
     root = Path(os.getenv("SAU_COOKIE_ROOT", "/app/sau_data/cookies"))
     return root / f"tenant_{tenant_id}" / platform / f"{sau_account_id}.json"
@@ -345,37 +345,25 @@ def _run_with_video(
 # ---------- platform extras helpers ----------
 
 
-def apply_location_into_desc(
+def apply_location_extras(
     desc: str | None, platform_payload: dict[str, Any]
 ) -> tuple[str | None, dict[str, Any]]:
-    """Append a ``location`` from ``platform_payload`` to the desc.
+    """Pull ``location`` out of ``platform_payload`` and forward it as a
+    constructor kwarg.
 
-    Used by douyin and xhs because their upstream Video classes don't
-    accept ``location`` in the constructor — the upstream ``set_location``
-    method is defined but never wired into ``upload()``. P5 will patch
-    the upload pipeline; P4 takes the pragmatic path of stuffing the
-    location into the desc footer so users still see something.
+    P5 wires the upstream ``set_location`` into douyin/xhs ``upload()``,
+    so the right path is to forward ``location`` to ``video_cls(...)``
+    rather than stuff it into the desc footer (the P4 hack). The runner
+    is the trust boundary on the sau side, so coerce defensively before
+    handing the value to Playwright.
     """
     if not isinstance(platform_payload, dict):
         return desc, {}
     raw_location = platform_payload.get("location")
-    # ``location`` is supposed to be a string but the runner is the trust
-    # boundary on the sau side — coerce defensively so a caller that sends
-    # a numeric ID / nested object can't crash the worker before the
-    # task's try/finally cleans up the tmp video.
     location = "" if raw_location is None else str(raw_location).strip()
     if not location:
         return desc, {}
-    base = (desc or "").rstrip()
-    suffix = f"\n📍 {location}" if base else f"📍 {location}"
-    return base + suffix, {}
-
-
-def ignore_platform_extras(
-    desc: str | None, platform_payload: dict[str, Any]
-) -> tuple[str | None, dict[str, Any]]:
-    """KS uploader has no location support — drop platform_payload."""
-    return desc, {}
+    return desc, {"location": location}
 
 
 # ---------- platform bindings (lazy-imported uploaders) ----------
@@ -396,26 +384,14 @@ def _import_xhs() -> tuple[Callable[[str], Awaitable[bool]], type]:
     return cookie_auth, XiaoHongShuVideo
 
 
-def _import_ks() -> tuple[Callable[[str], Awaitable[bool]], type]:
-    from uploader.ks_uploader.main import KSVideo, cookie_auth  # type: ignore
-
-    return cookie_auth, KSVideo
-
-
 DOUYIN = PlatformBinding(
     name="douyin",
     import_uploader=_import_douyin,
-    apply_platform_extras=apply_location_into_desc,
+    apply_platform_extras=apply_location_extras,
 )
 
 XHS = PlatformBinding(
     name="xhs",
     import_uploader=_import_xhs,
-    apply_platform_extras=apply_location_into_desc,
-)
-
-KS = PlatformBinding(
-    name="ks",
-    import_uploader=_import_ks,
-    apply_platform_extras=ignore_platform_extras,
+    apply_platform_extras=apply_location_extras,
 )

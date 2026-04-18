@@ -35,8 +35,6 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from sau_contracts import (
     PUBLISH_DOUYIN,
     PUBLISH_DOUYIN_QUEUE,
-    PUBLISH_KS,
-    PUBLISH_KS_QUEUE,
     PUBLISH_XHS,
     PUBLISH_XHS_QUEUE,
 )
@@ -50,7 +48,6 @@ router = APIRouter()
 _PLATFORM_TO_TASK: dict[str, tuple[str, str]] = {
     "douyin": (PUBLISH_DOUYIN, PUBLISH_DOUYIN_QUEUE),
     "xhs": (PUBLISH_XHS, PUBLISH_XHS_QUEUE),
-    "ks": (PUBLISH_KS, PUBLISH_KS_QUEUE),
 }
 
 

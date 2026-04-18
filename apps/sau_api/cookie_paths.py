@@ -11,7 +11,7 @@ from typing import Literal
 
 from fastapi import HTTPException
 
-Platform = Literal["douyin", "xhs", "ks"]
+Platform = Literal["douyin", "xhs"]
 
 COOKIE_ROOT = Path(os.getenv("SAU_COOKIE_ROOT", "/app/sau_data/cookies"))
 
