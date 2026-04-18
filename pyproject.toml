@@ -22,6 +22,7 @@ dependencies = [
   "celery>=5.3",
   "redis>=5.0",
   "gevent>=24.2.1",
+  "python-multipart>=0.0.9",
   "sau-contracts",
 ]
 

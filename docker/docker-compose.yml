@@ -21,9 +21,11 @@ services:
       SAU_RESULT_BACKEND: ${SAU_RESULT_BACKEND:-redis://:difyai123456@redis:6379/3}
       SAU_LOG_LEVEL: ${SAU_LOG_LEVEL:-info}
       SAU_API_WORKERS: ${SAU_API_WORKERS:-1}
+      SAU_TMP_DIR: ${SAU_TMP_DIR:-/app/sau_data/tmp}
       TZ: Asia/Shanghai
     volumes:
       - ../sau_data/cookies:/app/sau_data/cookies
+      - ../sau_data/tmp:/app/sau_data/tmp
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/health"]
       interval: 15s
@@ -41,10 +43,13 @@ services:
       SAU_BROKER_URL: ${SAU_BROKER_URL:-redis://:difyai123456@redis:6379/2}
       SAU_RESULT_BACKEND: ${SAU_RESULT_BACKEND:-redis://:difyai123456@redis:6379/3}
       SAU_LOG_LEVEL: ${SAU_LOG_LEVEL:-info}
-      SAU_WORKER_CONCURRENCY: ${SAU_WORKER_CONCURRENCY:-4}
+      SAU_WORKER_CONCURRENCY: ${SAU_WORKER_CONCURRENCY:-2}
+      SAU_WORKER_POOL: ${SAU_WORKER_POOL:-prefork}
+      SAU_TMP_DIR: ${SAU_TMP_DIR:-/app/sau_data/tmp}
       TZ: Asia/Shanghai
     volumes:
       - ../sau_data/cookies:/app/sau_data/cookies
+      - ../sau_data/tmp:/app/sau_data/tmp
     depends_on:
       sau-api:
         condition: service_healthy

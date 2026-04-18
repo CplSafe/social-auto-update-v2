@@ -7,12 +7,13 @@ set -euo pipefail
 
 ./scripts/ensure_cookie_dir.sh
 
-# P0 uses `gevent` because tasks are stubs. Before P1 wires real Playwright
-# uploaders, switch to `--pool=prefork` (or `solo` if concurrency stays low):
-# Playwright/Patchright is async/browser-heavy and does not coexist well
-# with gevent monkey-patching.
+# P2 onwards uses `prefork` because publish tasks drive Playwright /
+# Patchright; gevent monkey-patching breaks the asyncio loop those
+# uploaders need. concurrency defaults to 2 — each prefork process boots
+# its own Chromium (≈1.5GB RSS), so 2 fits a 4GB container with headroom
+# for the API process.
 exec uv run celery -A apps.sau_worker.celery_app worker \
     --queues=publish_douyin,publish_xhs,publish_ks \
-    --pool="${SAU_WORKER_POOL:-gevent}" \
-    --concurrency="${SAU_WORKER_CONCURRENCY:-4}" \
+    --pool="${SAU_WORKER_POOL:-prefork}" \
+    --concurrency="${SAU_WORKER_CONCURRENCY:-2}" \
     --loglevel="${SAU_LOG_LEVEL:-info}"

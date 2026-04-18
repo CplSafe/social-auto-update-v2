@@ -69,4 +69,42 @@ curl -sf "http://127.0.0.1:$PORT/accounts/$SAU_ID/check?tenant_id=t1&platform=do
     -H "X-Sau-Token: $TOKEN"
 echo
 
+step "7. /postVideo with multipart and tiny payload"
+echo "fake video bytes" > /tmp/sau-mock-fake-video.mp4
+PUBLISH=$(curl -sf -X POST "http://127.0.0.1:$PORT/postVideo" \
+    -H "X-Sau-Token: $TOKEN" \
+    -F 'video=@/tmp/sau-mock-fake-video.mp4;type=video/mp4' \
+    -F 'data={"tenant_id":"t1","platform":"douyin","sau_account_id":"acc-1","title":"hello"}')
+echo "$PUBLISH"
+SAU_TASK=$(printf '%s' "$PUBLISH" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sau_task_id"])')
+
+step "8. /tasks/{id} until SUCCESS"
+for i in 1 2 3 4 5; do
+    STATE=$(curl -sf "http://127.0.0.1:$PORT/tasks/$SAU_TASK" -H "X-Sau-Token: $TOKEN")
+    echo "poll #$i: $STATE"
+    case "$STATE" in
+        *'"state":"SUCCESS"'*) break ;;
+    esac
+    sleep 1
+done
+case "$STATE" in
+    *'"success":true'*) ;;
+    *) echo "FAIL: publish never succeeded" >&2; exit 1 ;;
+esac
+
+step "9. /postVideo with MOCK_FAIL sentinel"
+FAIL_PUBLISH=$(curl -sf -X POST "http://127.0.0.1:$PORT/postVideo" \
+    -H "X-Sau-Token: $TOKEN" \
+    -F 'video=@/tmp/sau-mock-fake-video.mp4;type=video/mp4' \
+    -F 'data={"tenant_id":"t1","platform":"douyin","sau_account_id":"acc-1","title":"MOCK_FAIL_test"}')
+FAIL_TASK=$(printf '%s' "$FAIL_PUBLISH" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sau_task_id"])')
+sleep 4
+FAIL_STATE=$(curl -sf "http://127.0.0.1:$PORT/tasks/$FAIL_TASK" -H "X-Sau-Token: $TOKEN")
+echo "$FAIL_STATE"
+case "$FAIL_STATE" in
+    *'"success":false'*) ;;
+    *) echo "FAIL: MOCK_FAIL didn't surface as failure" >&2; exit 1 ;;
+esac
+
+rm -f /tmp/sau-mock-fake-video.mp4
 printf '\nALL PASS\n'

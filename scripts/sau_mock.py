@@ -32,10 +32,23 @@ import logging
 import os
 import secrets
 import time
-from typing import Any, Literal
+import json
+import uuid
+from typing import Annotated, Any, Literal
 
 import uvicorn
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import (
+    Body,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 from pydantic import BaseModel
 
 logger = logging.getLogger("sau-mock")
@@ -48,6 +61,9 @@ Platform = Literal["douyin", "xhs", "ks"]
 
 MOCK_SCAN_DELAY_SEC = float(os.getenv("MOCK_SCAN_DELAY_SEC", "4"))
 MOCK_AUTH_DELAY_SEC = float(os.getenv("MOCK_AUTH_DELAY_SEC", "6"))
+# /postVideo: how long after enqueue before /tasks reports SUCCESS.
+MOCK_PUBLISH_DURATION_SEC = float(os.getenv("MOCK_PUBLISH_DURATION_SEC", "3"))
+MOCK_PUBLISH_RESULT_URL = os.getenv("MOCK_PUBLISH_RESULT_URL", "https://www.douyin.com/video/mock-publish-result")
 
 
 def _load_token() -> str:
@@ -71,6 +87,8 @@ def verify_token(x_sau_token: str | None = Header(default=None, alias="X-Sau-Tok
 _sessions: dict[str, dict[str, Any]] = {}
 # (tenant_id, platform, sau_account_id) -> bool valid
 _cookies: dict[tuple[str, str, str], bool] = {}
+# sau_task_id -> {started_at, payload, tenant_id, sau_account_id, force_failure}
+_tasks: dict[str, dict[str, Any]] = {}
 
 
 def _fake_qr_png_base64() -> str:
@@ -180,6 +198,90 @@ def delete_account(
     existed = key in _cookies
     _cookies.pop(key, None)
     return {"deleted": existed}
+
+
+@app.post("/postVideo", dependencies=[Depends(verify_token)])
+async def post_video(
+    video: Annotated[UploadFile, File()],
+    data: Annotated[str, Form()],
+) -> dict[str, str]:
+    try:
+        envelope: dict[str, Any] = json.loads(data)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid data json: {exc}") from exc
+
+    tenant_id = str(envelope.get("tenant_id") or "")
+    platform = envelope.get("platform")
+    sau_account_id = str(envelope.get("sau_account_id") or "")
+    title = str(envelope.get("title") or "")
+    if not tenant_id or not sau_account_id or not platform or not title:
+        raise HTTPException(
+            status_code=400,
+            detail="data must include tenant_id, sau_account_id, platform, title",
+        )
+
+    body = await video.read()
+    if not body:
+        raise HTTPException(status_code=400, detail="empty video payload")
+
+    sau_task_id = str(uuid.uuid4())
+    # Force failure when title starts with the sentinel — handy for FE
+    # error-state QA without touching code.
+    force_failure = title.startswith("MOCK_FAIL")
+    _tasks[sau_task_id] = {
+        "started_at": time.monotonic(),
+        "payload": envelope,
+        "force_failure": force_failure,
+        "size_bytes": len(body),
+    }
+    logger.info(
+        "queued mock publish",
+        extra={
+            "sau_task_id": sau_task_id,
+            "tenant_id": tenant_id,
+            "size_bytes": len(body),
+        },
+    )
+    return {"sau_task_id": sau_task_id}
+
+
+@app.get("/tasks/{sau_task_id}", dependencies=[Depends(verify_token)])
+def get_task(sau_task_id: str) -> dict[str, Any]:
+    task = _tasks.get(sau_task_id)
+    if task is None:
+        return {"sau_task_id": sau_task_id, "state": "PENDING", "result": None, "error": None}
+
+    elapsed = time.monotonic() - task["started_at"]
+    if elapsed < MOCK_PUBLISH_DURATION_SEC:
+        return {
+            "sau_task_id": sau_task_id,
+            "state": "STARTED" if elapsed > MOCK_PUBLISH_DURATION_SEC / 2 else "PENDING",
+            "result": None,
+            "error": None,
+        }
+
+    if task["force_failure"]:
+        return {
+            "sau_task_id": sau_task_id,
+            "state": "SUCCESS",
+            "result": {
+                "success": False,
+                "status": "upload_failed",
+                "message": "MOCK_FAIL sentinel — simulated failure",
+            },
+            "error": None,
+        }
+
+    return {
+        "sau_task_id": sau_task_id,
+        "state": "SUCCESS",
+        "result": {
+            "success": True,
+            "status": "success",
+            "current_url": MOCK_PUBLISH_RESULT_URL,
+        },
+        "error": None,
+    }
 
 
 # ---------- entry ----------
