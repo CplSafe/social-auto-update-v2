@@ -21,6 +21,7 @@ Env knobs:
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import os
 import uuid
@@ -58,14 +59,26 @@ class LoginRequest(BaseModel):
     sau_account_id: str | None = None
 
 
+# P4: scan-to-auth coverage by platform. KS uploader doesn't expose a
+# `*_cookie_gen` function in upstream yet, so we surface that gap as a
+# typed 400 instead of a confusing 500. When upstream catches up the
+# entry just gets added here.
+_PLATFORM_LOGIN_SUPPORT: dict[str, tuple[str, str] | None] = {
+    "douyin": ("uploader.douyin_uploader.main", "douyin_cookie_gen"),
+    "xhs": ("uploader.xiaohongshu_uploader.main", "xiaohongshu_cookie_gen"),
+    "ks": None,
+}
+
+
 @router.post("/login")
 async def start_login(req: LoginRequest) -> dict[str, Any]:
-    if req.platform != "douyin":
-        # P1 only wires douyin; xhs/ks land in P4. Surface the contract gap
-        # explicitly rather than silently accepting and never progressing.
+    cookie_gen_target = _PLATFORM_LOGIN_SUPPORT.get(req.platform)
+    if cookie_gen_target is None:
         raise HTTPException(
             status_code=400,
-            detail=f"platform {req.platform!r} is not supported in P1",
+            detail=(
+                f"platform {req.platform!r} scan-to-auth is not yet supported"
+            ),
         )
 
     sau_account_id = req.sau_account_id or _new_sau_account_id()
@@ -118,15 +131,18 @@ async def start_login(req: LoginRequest) -> dict[str, Any]:
         qr_ready.set()
 
     async def runner() -> None:
-        # Imported lazily so the stub-only path doesn't require Playwright /
-        # patchright at module import time.
-        from uploader.douyin_uploader.main import douyin_cookie_gen  # type: ignore
+        # Lazily import the platform-specific cookie_gen so the stub-only path
+        # doesn't pull in Playwright / patchright at module import time, and
+        # so the xhs path doesn't accidentally hit douyin uploader code.
+        module_path, fn_name = cookie_gen_target
+        module = importlib.import_module(module_path)
+        cookie_gen_fn = getattr(module, fn_name)
 
         poll_interval = int(os.getenv("SAU_LOGIN_POLL_INTERVAL_SEC", "3"))
         max_checks = int(os.getenv("SAU_LOGIN_MAX_CHECKS", "60"))
         headless = os.getenv("SAU_LOGIN_HEADLESS", "1").lower() in ("1", "true", "yes")
         try:
-            result = await douyin_cookie_gen(
+            result = await cookie_gen_fn(
                 str(cookie_path),
                 qrcode_callback=qrcode_callback,
                 poll_interval=poll_interval,
@@ -140,7 +156,9 @@ async def start_login(req: LoginRequest) -> dict[str, Any]:
             raise
         except Exception as exc:  # noqa: BLE001 — log + propagate to session
             logger.exception(
-                "douyin_cookie_gen crashed", extra={"session_id": req.session_id}
+                "%s crashed",
+                fn_name,
+                extra={"session_id": req.session_id},
             )
             await registry.update(req.session_id, status="failed", message=str(exc))
             return

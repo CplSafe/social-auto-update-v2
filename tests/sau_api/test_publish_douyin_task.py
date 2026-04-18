@@ -1,21 +1,26 @@
 """Worker-level tests for publish_douyin.
 
-We monkey-patch the lazy import inside ``_run_douyin_publish`` so the suite
-runs without booting Playwright. Tests cover the cookie-missing fast-fail,
-the title-required guard, the success path and the upstream-error
-classification.
+Since P4 the publish task is a thin wrapper around
+``apps.sau_worker._publish_runner.run_publish`` — these tests therefore
+monkey-patch helpers on the *runner* module (not the task module) so the
+suite runs without booting Playwright. Tests cover the cookie-missing
+fast-fail, the title-required guard, the success path, the upstream-
+error classification, and the rate-limit gates.
 """
 
 from __future__ import annotations
 
 import sys
 import types
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
+from apps.sau_worker import _publish_rate_limit, _publish_runner
 from apps.sau_worker.tasks import publish_douyin as task_module
 
 
@@ -29,9 +34,8 @@ def cookie_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def bypass_rate_limit_and_concurrency(monkeypatch: pytest.MonkeyPatch):
     """Stub the P3 limiter + gate so unit tests exercise the publish flow
     without booting a real Redis. Tests that explicitly want to assert on
-    rate-limit / gate behaviour can monkey-patch the singletons inline."""
-    from types import SimpleNamespace
-
+    rate-limit / gate behaviour can monkey-patch ``hooks_for`` /
+    ``tenant_gate`` inline."""
     allow_bucket = SimpleNamespace(
         wait_or_acquire=lambda *_a, **_k: True,
         try_acquire=lambda *_a, **_k: SimpleNamespace(allowed=True, retry_after_seconds=0),
@@ -39,8 +43,6 @@ def bypass_rate_limit_and_concurrency(monkeypatch: pytest.MonkeyPatch):
 
     class _AlwaysAcquireGate:
         def slot(self, *_a, **_k):
-            from contextlib import contextmanager
-
             @contextmanager
             def cm():
                 yield True
@@ -56,15 +58,19 @@ def bypass_rate_limit_and_concurrency(monkeypatch: pytest.MonkeyPatch):
         def wait_or_acquire(self, *_a, **_k):
             return True
 
-    gate_instance = _AlwaysAcquireGate()
-    monkeypatch.setattr(task_module, "_per_account_bucket", lambda: allow_bucket)
-    monkeypatch.setattr(task_module, "_platform_bucket", lambda: allow_bucket)
-    monkeypatch.setattr(task_module, "_tenant_gate", lambda: gate_instance)
-    # Ensure the cached singletons are dropped between tests so a leaky
-    # cache from one test doesn't leak rate-limit state into another.
-    monkeypatch.setattr(task_module, "_PER_ACCOUNT_BUCKET", None, raising=False)
-    monkeypatch.setattr(task_module, "_PLATFORM_BUCKET", None, raising=False)
-    monkeypatch.setattr(task_module, "_TENANT_GATE", None, raising=False)
+    allow_hooks = SimpleNamespace(
+        per_account=lambda: allow_bucket,
+        platform=lambda: allow_bucket,
+    )
+    monkeypatch.setattr(
+        task_module, "hooks_for", lambda _platform: allow_hooks
+    )
+    monkeypatch.setattr(
+        task_module, "tenant_gate", lambda: _AlwaysAcquireGate()
+    )
+    # Drop any singletons that earlier tests in this process may have
+    # cached so each test starts with a clean slate.
+    _publish_rate_limit.reset_for_tests()
     yield
 
 
@@ -82,7 +88,7 @@ def _install_fake_uploader(
     upload_raises: BaseException | None = None,
 ) -> dict[str, Any]:
     """Install a fake `uploader.douyin_uploader.main` module so the lazy
-    import inside the task resolves to it. Returns a dict that lets the
+    import inside the runner resolves to it. Returns a dict that lets the
     test peek at what was constructed."""
     captured: dict[str, Any] = {}
 
@@ -165,7 +171,6 @@ class TestRunDouyinPublishWiring:
         captured = _install_fake_uploader(monkeypatch)
 
         result = task_module.publish_douyin.run(
-    
             tenant_id="t",
             sau_account_id="acc",
             video_path=str(temp_video),
@@ -189,7 +194,6 @@ class TestRunDouyinPublishWiring:
         _install_fake_uploader(monkeypatch, cookie_auth_returns=False)
 
         result = task_module.publish_douyin.run(
-    
             tenant_id="t",
             sau_account_id="acc",
             video_path=str(temp_video),
@@ -207,7 +211,6 @@ class TestRunDouyinPublishWiring:
         _install_fake_uploader(monkeypatch, upload_raises=RuntimeError("xpath gone"))
 
         result = task_module.publish_douyin.run(
-    
             tenant_id="t",
             sau_account_id="acc",
             video_path=str(temp_video),
@@ -219,9 +222,9 @@ class TestRunDouyinPublishWiring:
 
 
 class TestPathTraversalGuard:
-    def test_rejects_dotdot_in_tenant_id(self, cookie_root, temp_video, monkeypatch):
+    def test_rejects_dotdot_in_tenant_id(self):
         with pytest.raises(ValueError):
-            task_module._resolve_cookie_path("../../etc", "acc")
+            _publish_runner.resolve_cookie_path("../../etc", "douyin", "acc")
 
 
 class TestVideoUrlPath:
@@ -242,7 +245,7 @@ class TestVideoUrlPath:
             dest.write_bytes(b"streamed bytes")
             return dest
 
-        monkeypatch.setattr(task_module, "_download_video_url", fake_download)
+        monkeypatch.setattr(_publish_runner, "download_video_url", fake_download)
 
         result = task_module.publish_douyin.run(
             tenant_id="t",
@@ -270,7 +273,7 @@ class TestVideoUrlPath:
         def boom(url, *, dest):
             raise RuntimeError("403 forbidden")
 
-        monkeypatch.setattr(task_module, "_download_video_url", boom)
+        monkeypatch.setattr(_publish_runner, "download_video_url", boom)
 
         result = task_module.publish_douyin.run(
             tenant_id="t",
@@ -290,11 +293,19 @@ class TestRateLimiterGating:
         cookie = cookie_root / "tenant_t" / "douyin" / "acc.json"
         cookie.parent.mkdir(parents=True)
         cookie.write_text("{}")
-        # Force the per-account bucket to refuse.
-        from types import SimpleNamespace
 
-        deny = SimpleNamespace(wait_or_acquire=lambda *_a, **_k: False)
-        monkeypatch.setattr(task_module, "_per_account_bucket", lambda: deny)
+        # Force the per-account bucket to refuse, but keep the platform
+        # bucket allowing — the publish runner short-circuits on the first
+        # refusal so this is enough.
+        deny_bucket = SimpleNamespace(wait_or_acquire=lambda *_a, **_k: False)
+        allow_bucket = SimpleNamespace(wait_or_acquire=lambda *_a, **_k: True)
+        deny_hooks = SimpleNamespace(
+            per_account=lambda: deny_bucket,
+            platform=lambda: allow_bucket,
+        )
+        monkeypatch.setattr(
+            task_module, "hooks_for", lambda _platform: deny_hooks
+        )
 
         result = task_module.publish_douyin.run(
             tenant_id="t",

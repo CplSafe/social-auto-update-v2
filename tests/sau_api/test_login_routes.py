@@ -85,12 +85,30 @@ class TestLoginStubMode:
         assert (cookie_root / "tenant_tenant-xyz" / "douyin").exists()
 
     def test_rejects_unsupported_platform(self, client, auth_header):
+        # P4: ks scan-to-auth is not yet supported (no upstream cookie_gen).
+        # Should surface as a 400 with a helpful message rather than 500.
         resp = client.post(
             "/login",
             headers=auth_header,
-            json={"tenant_id": "t1", "platform": "xhs", "session_id": "sid-bad"},
+            json={"tenant_id": "t1", "platform": "ks", "session_id": "sid-bad"},
         )
         assert resp.status_code == 400
+        assert "ks" in resp.json()["detail"]
+
+    def test_xhs_login_supported_in_stub_mode(self, client, auth_header):
+        # P4: xhs scan-to-auth must reach the QR-stub branch, not the
+        # 400 platform-unsupported branch.
+        sid = str(uuid.uuid4())
+        resp = client.post(
+            "/login",
+            headers=auth_header,
+            json={"tenant_id": "t-xhs", "platform": "xhs", "session_id": sid},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["qr_image_base64"].startswith("data:image/png;base64,")
+        cookie_root = Path(os.environ["SAU_COOKIE_ROOT"])
+        assert (cookie_root / "tenant_t-xhs" / "xhs").exists()
 
     def test_rejects_path_traversal_in_tenant_id(self, client, auth_header):
         # cookie_paths.resolve_cookie_path raises HTTPException 400.
