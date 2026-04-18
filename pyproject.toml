@@ -15,7 +15,18 @@ dependencies = [
   "qrcode==8.2",
   "requests==2.32.3",
   "segno>=1.6.6",
+  # Added by P0 (sau-api + sau-worker shell). Keep this group below
+  # the upstream deps to minimise merge-conflict surface.
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "celery>=5.3",
+  "redis>=5.0",
+  "gevent>=24.2.1",
+  "sau-contracts",
 ]
+
+[tool.uv.sources]
+sau-contracts = { path = "packages/sau_contracts", editable = true }
 
 [project.scripts]
 sau = "sau_cli:main"

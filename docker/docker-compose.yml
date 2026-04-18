@@ -1,0 +1,63 @@
+# sau (social-auto-upload) — sau-api + sau-worker
+#
+# Network: this compose joins Dify's existing default network so it can
+# reach Dify's redis service by hostname `redis`. The default Dify network
+# name depends on the host directory of dify's docker-compose project.
+# Run `docker network ls` and adjust `name:` below if needed.
+
+services:
+  sau-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: sau:p0
+    container_name: sau-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8001:8001"
+    environment:
+      SAU_INTERNAL_TOKEN: ${SAU_INTERNAL_TOKEN:?must set SAU_INTERNAL_TOKEN}
+      SAU_BROKER_URL: ${SAU_BROKER_URL:-redis://:difyai123456@redis:6379/2}
+      SAU_RESULT_BACKEND: ${SAU_RESULT_BACKEND:-redis://:difyai123456@redis:6379/3}
+      SAU_LOG_LEVEL: ${SAU_LOG_LEVEL:-info}
+      SAU_API_WORKERS: ${SAU_API_WORKERS:-2}
+      TZ: Asia/Shanghai
+    volumes:
+      - ../sau_data/cookies:/app/sau_data/cookies
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+  sau-worker:
+    image: sau:p0
+    container_name: sau-worker
+    restart: unless-stopped
+    command: ["docker/entrypoint-worker.sh"]
+    environment:
+      SAU_INTERNAL_TOKEN: ${SAU_INTERNAL_TOKEN:?must set SAU_INTERNAL_TOKEN}
+      SAU_BROKER_URL: ${SAU_BROKER_URL:-redis://:difyai123456@redis:6379/2}
+      SAU_RESULT_BACKEND: ${SAU_RESULT_BACKEND:-redis://:difyai123456@redis:6379/3}
+      SAU_LOG_LEVEL: ${SAU_LOG_LEVEL:-info}
+      SAU_WORKER_CONCURRENCY: ${SAU_WORKER_CONCURRENCY:-4}
+      TZ: Asia/Shanghai
+    volumes:
+      - ../sau_data/cookies:/app/sau_data/cookies
+    depends_on:
+      sau-api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'uv run celery -A apps.sau_worker.celery_app inspect ping -d "celery@$$HOSTNAME" || exit 1'
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+networks:
+  default:
+    name: ${SAU_NETWORK_NAME:?SAU_NETWORK_NAME must be set — run "docker network ls" and pick the network Dify joined (e.g. dify_default, docker_default)}
+    external: true
