@@ -20,7 +20,7 @@ services:
       SAU_BROKER_URL: ${SAU_BROKER_URL:-redis://:difyai123456@redis:6379/2}
       SAU_RESULT_BACKEND: ${SAU_RESULT_BACKEND:-redis://:difyai123456@redis:6379/3}
       SAU_LOG_LEVEL: ${SAU_LOG_LEVEL:-info}
-      SAU_API_WORKERS: ${SAU_API_WORKERS:-2}
+      SAU_API_WORKERS: ${SAU_API_WORKERS:-1}
       TZ: Asia/Shanghai
     volumes:
       - ../sau_data/cookies:/app/sau_data/cookies
