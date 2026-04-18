@@ -202,8 +202,8 @@ def delete_account(
 
 @app.post("/postVideo", dependencies=[Depends(verify_token)])
 async def post_video(
-    video: Annotated[UploadFile, File()],
     data: Annotated[str, Form()],
+    video: Annotated[UploadFile | None, File()] = None,
 ) -> dict[str, str]:
     try:
         envelope: dict[str, Any] = json.loads(data)
@@ -220,9 +220,21 @@ async def post_video(
             detail="data must include tenant_id, sau_account_id, platform, title",
         )
 
-    body = await video.read()
-    if not body:
-        raise HTTPException(status_code=400, detail="empty video payload")
+    video_url = envelope.get("video_url")
+    has_video_file = video is not None and (video.filename or video.size)
+    if (video_url is None) == (not has_video_file):
+        raise HTTPException(
+            status_code=400,
+            detail="provide exactly one of video file or video_url",
+        )
+
+    size_bytes = 0
+    if has_video_file:
+        assert video is not None
+        body = await video.read()
+        if not body:
+            raise HTTPException(status_code=400, detail="empty video payload")
+        size_bytes = len(body)
 
     sau_task_id = str(uuid.uuid4())
     # Force failure when title starts with the sentinel — handy for FE
@@ -232,14 +244,16 @@ async def post_video(
         "started_at": time.monotonic(),
         "payload": envelope,
         "force_failure": force_failure,
-        "size_bytes": len(body),
+        "size_bytes": size_bytes,
+        "video_url": video_url,
     }
     logger.info(
         "queued mock publish",
         extra={
             "sau_task_id": sau_task_id,
             "tenant_id": tenant_id,
-            "size_bytes": len(body),
+            "transport": "url" if video_url else "multipart",
+            "size_bytes": size_bytes,
         },
     )
     return {"sau_task_id": sau_task_id}

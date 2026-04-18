@@ -26,4 +26,14 @@ app.conf.update(
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
     task_default_queue="publish_douyin",
+    # Default priority for tasks dispatched without an explicit value —
+    # corresponds to the "mid" tier in the Dify-side TierResolver.
+    task_default_priority=5,
+    # P3: priority queueing on Redis broker. Without these knobs Celery
+    # ignores the per-task ``priority`` kw-arg and FIFOs everything.
+    broker_transport_options={
+        "priority_steps": list(range(10)),
+        "sep": ":",
+        "queue_order_strategy": "priority",
+    },
 )

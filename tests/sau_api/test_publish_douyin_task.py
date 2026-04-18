@@ -25,6 +25,49 @@ def cookie_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def bypass_rate_limit_and_concurrency(monkeypatch: pytest.MonkeyPatch):
+    """Stub the P3 limiter + gate so unit tests exercise the publish flow
+    without booting a real Redis. Tests that explicitly want to assert on
+    rate-limit / gate behaviour can monkey-patch the singletons inline."""
+    from types import SimpleNamespace
+
+    allow_bucket = SimpleNamespace(
+        wait_or_acquire=lambda *_a, **_k: True,
+        try_acquire=lambda *_a, **_k: SimpleNamespace(allowed=True, retry_after_seconds=0),
+    )
+
+    class _AlwaysAcquireGate:
+        def slot(self, *_a, **_k):
+            from contextlib import contextmanager
+
+            @contextmanager
+            def cm():
+                yield True
+
+            return cm()
+
+        def try_acquire(self, *_a, **_k):
+            return True
+
+        def release(self, *_a, **_k):
+            return None
+
+        def wait_or_acquire(self, *_a, **_k):
+            return True
+
+    gate_instance = _AlwaysAcquireGate()
+    monkeypatch.setattr(task_module, "_per_account_bucket", lambda: allow_bucket)
+    monkeypatch.setattr(task_module, "_platform_bucket", lambda: allow_bucket)
+    monkeypatch.setattr(task_module, "_tenant_gate", lambda: gate_instance)
+    # Ensure the cached singletons are dropped between tests so a leaky
+    # cache from one test doesn't leak rate-limit state into another.
+    monkeypatch.setattr(task_module, "_PER_ACCOUNT_BUCKET", None, raising=False)
+    monkeypatch.setattr(task_module, "_PLATFORM_BUCKET", None, raising=False)
+    monkeypatch.setattr(task_module, "_TENANT_GATE", None, raising=False)
+    yield
+
+
 @pytest.fixture
 def temp_video(tmp_path: Path) -> Path:
     f = tmp_path / "vid.mp4"
@@ -179,3 +222,87 @@ class TestPathTraversalGuard:
     def test_rejects_dotdot_in_tenant_id(self, cookie_root, temp_video, monkeypatch):
         with pytest.raises(ValueError):
             task_module._resolve_cookie_path("../../etc", "acc")
+
+
+class TestVideoUrlPath:
+    def test_downloads_url_when_video_path_missing(
+        self, cookie_root, tmp_path, monkeypatch
+    ):
+        cookie = cookie_root / "tenant_t" / "douyin" / "acc.json"
+        cookie.parent.mkdir(parents=True)
+        cookie.write_text("{}")
+        captured = _install_fake_uploader(monkeypatch)
+        # Redirect tmp dir so we can assert + clean up easily.
+        monkeypatch.setenv("SAU_TMP_DIR", str(tmp_path / "sau-tmp"))
+
+        downloads: list[str] = []
+
+        def fake_download(url, *, dest):
+            downloads.append(url)
+            dest.write_bytes(b"streamed bytes")
+            return dest
+
+        monkeypatch.setattr(task_module, "_download_video_url", fake_download)
+
+        result = task_module.publish_douyin.run(
+            tenant_id="t",
+            sau_account_id="acc",
+            payload={"title": "hi"},
+            video_url="https://signed/url",
+        )
+        assert result["success"] is True
+        # Worker materialised the URL once.
+        assert downloads == ["https://signed/url"]
+        # And handed the resulting on-disk path to DouYinVideo.
+        assert captured["init_kwargs"]["file_path"].endswith(".mp4")
+        # And cleaned the file up after.
+        assert not Path(captured["init_kwargs"]["file_path"]).exists()
+
+    def test_returns_failed_when_download_raises(
+        self, cookie_root, tmp_path, monkeypatch
+    ):
+        cookie = cookie_root / "tenant_t" / "douyin" / "acc.json"
+        cookie.parent.mkdir(parents=True)
+        cookie.write_text("{}")
+        _install_fake_uploader(monkeypatch)
+        monkeypatch.setenv("SAU_TMP_DIR", str(tmp_path / "sau-tmp"))
+
+        def boom(url, *, dest):
+            raise RuntimeError("403 forbidden")
+
+        monkeypatch.setattr(task_module, "_download_video_url", boom)
+
+        result = task_module.publish_douyin.run(
+            tenant_id="t",
+            sau_account_id="acc",
+            payload={"title": "hi"},
+            video_url="https://signed/url",
+        )
+        assert result["success"] is False
+        assert result["status"] == "upload_failed"
+        assert "403" in result["message"]
+
+
+class TestRateLimiterGating:
+    def test_per_account_rate_limit_returns_rate_limited(
+        self, cookie_root, temp_video, monkeypatch
+    ):
+        cookie = cookie_root / "tenant_t" / "douyin" / "acc.json"
+        cookie.parent.mkdir(parents=True)
+        cookie.write_text("{}")
+        # Force the per-account bucket to refuse.
+        from types import SimpleNamespace
+
+        deny = SimpleNamespace(wait_or_acquire=lambda *_a, **_k: False)
+        monkeypatch.setattr(task_module, "_per_account_bucket", lambda: deny)
+
+        result = task_module.publish_douyin.run(
+            tenant_id="t",
+            sau_account_id="acc",
+            payload={"title": "hi"},
+            video_path=str(temp_video),
+        )
+        assert result["success"] is False
+        assert result["status"] == "rate_limited"
+        # Cleaned up the temp file even though we never started the upload.
+        assert not temp_video.exists()

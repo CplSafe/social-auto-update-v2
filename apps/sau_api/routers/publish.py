@@ -1,22 +1,25 @@
-"""Publish endpoint — accepts multipart upload from Dify api and dispatches
-the bytes to the matching Celery worker.
+"""Publish endpoint — accepts a video from Dify api and dispatches the
+upload to the matching Celery worker.
 
-Wire shape (P2):
+Wire shape:
 
     POST /postVideo
         multipart/form-data:
-            video: <binary>          # the actual file
-            data:  <json string>     # {tenant_id, platform, sau_account_id,
-                                     #  title, tags?, desc?, publish_date?}
+            video?: <binary>           # P2 multipart path (omit when video_url is set)
+            data:   <json string>      # {tenant_id, platform, sau_account_id,
+                                       #  title, tags?, desc?, publish_date?,
+                                       #  priority?, video_url?}
 
-The JSON envelope keeps the Dify side from having to know the exact set of
-form fields; everything user-tunable lives inside ``data`` and the worker
-parses it.
+P2 always sent the bytes inline. P3 adds a ``video_url`` envelope field
+(presigned download URL) so the worker fetches the video itself,
+bypassing the Dify api process for large files. Exactly one of
+``video`` (multipart) or ``video_url`` (envelope field) must be set.
 
-The video bytes are persisted to ``${SAU_TMP_DIR}/<sau_task_id>.<ext>`` so
-the Celery worker can read the file from disk regardless of which process
-runs the task. The worker is responsible for unlinking the temp file in
-its ``finally`` clause.
+When the bytes are sent inline, they're persisted to
+``${SAU_TMP_DIR}/<sau_task_id>.<ext>`` so the Celery worker can read
+the file from disk regardless of which process runs the task. The
+worker is responsible for unlinking the temp file in its ``finally``
+clause. The URL path defers the disk write to the worker.
 """
 
 from __future__ import annotations
@@ -67,10 +70,18 @@ def _safe_suffix(filename: str) -> str:
     return ".mp4"
 
 
+def _coerce_priority(value: Any) -> int:
+    try:
+        priority = int(value)
+    except (TypeError, ValueError):
+        return 5
+    return max(0, min(9, priority))
+
+
 @router.post("/postVideo")
 async def post_video(
-    video: Annotated[UploadFile, File(description="The video to publish")],
     data: Annotated[str, Form(description="JSON envelope with platform metadata")],
+    video: Annotated[UploadFile | None, File(description="The video to publish (multipart path)")] = None,
 ) -> dict[str, str]:
     try:
         envelope: dict[str, Any] = json.loads(data)
@@ -87,25 +98,35 @@ async def post_video(
         )
     platform_typed: Platform = platform  # type: ignore[assignment]
 
-    raw_bytes = await video.read()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="video payload is empty")
+    video_url = envelope.get("video_url")
+    has_video_file = video is not None and (video.filename or video.size)
+    if (video_url is None) == (not has_video_file):
+        raise HTTPException(
+            status_code=400,
+            detail="provide exactly one of video (multipart) or video_url (envelope)",
+        )
 
-    # Mint the task id locally so the on-disk filename matches what the
-    # worker logs and what Dify polls. Celery accepts a pre-set task_id on
-    # send_task and uses it verbatim.
     task_uuid = str(uuid.uuid4())
-    suffix = _safe_suffix(video.filename or "")
-    tmp_root = _tmp_dir()
-    final_path = tmp_root / f"{task_uuid}{suffix}"
-    final_path.write_bytes(raw_bytes)
-    final_path.chmod(0o600)
+    final_path: Path | None = None
+
+    if has_video_file:
+        # P2 path: persist the upload now so the worker has a stable path.
+        assert video is not None
+        raw_bytes = await video.read()
+        if not raw_bytes:
+            raise HTTPException(status_code=400, detail="video payload is empty")
+        suffix = _safe_suffix(video.filename or "")
+        tmp_root = _tmp_dir()
+        final_path = tmp_root / f"{task_uuid}{suffix}"
+        final_path.write_bytes(raw_bytes)
+        final_path.chmod(0o600)
 
     payload = {
         k: v
         for k, v in envelope.items()
-        if k not in {"tenant_id", "platform", "sau_account_id"}
+        if k not in {"tenant_id", "platform", "sau_account_id", "video_url", "priority"}
     }
+    priority = _coerce_priority(envelope.get("priority"))
 
     task_name, queue = _PLATFORM_TO_TASK[platform_typed]
     try:
@@ -115,20 +136,23 @@ async def post_video(
             kwargs={
                 "tenant_id": tenant_id,
                 "sau_account_id": sau_account_id,
-                "video_path": str(final_path),
+                "video_path": str(final_path) if final_path is not None else None,
+                "video_url": str(video_url) if video_url else None,
                 "payload": payload,
             },
             queue=queue,
+            priority=priority,
         )
     except Exception:
         # Dispatch failed — clean up the temp file so we don't leak disk.
-        try:
-            final_path.unlink(missing_ok=True)
-        except OSError:
-            logger.exception(
-                "failed to clean up tmp video after dispatch failure",
-                extra={"path": str(final_path)},
-            )
+        if final_path is not None:
+            try:
+                final_path.unlink(missing_ok=True)
+            except OSError:
+                logger.exception(
+                    "failed to clean up tmp video after dispatch failure",
+                    extra={"path": str(final_path)},
+                )
         raise
 
     logger.info(
@@ -137,7 +161,8 @@ async def post_video(
             "sau_task_id": async_result.id,
             "tenant_id": tenant_id,
             "platform": platform_typed,
-            "size_bytes": len(raw_bytes),
+            "transport": "url" if video_url else "multipart",
+            "priority": priority,
         },
     )
 
