@@ -433,15 +433,28 @@ async def _fill_sms_code(page, code: str) -> bool:
 async def _click_sms_submit(page) -> bool:
     """Click the「验证」/ submit button on the SMS input page.
 
-    Like _fill_sms_code, must scope to the SMS dialog because the
-    underlying creator login page also has buttons that match "验证"
-    (e.g. "验证码登录" tab on the password form). Without scoping,
-    .first picks one of those and we click into the wrong page.
+    抖音's submit "button" is NOT a <button> element — it's a plain <div>
+    with class ``uc_verification_component_btn-...`` and the literal text
+    "验证". Confirmed via DOM dump:
+
+        <div class="uc_verification_component_btn-EQNDAT
+                    content-Fpuout primary-Npo6wt large-WT6qX5">验证</div>
+
+    Sister「取消」button has the same class structure with ``secondary-...``
+    instead of ``primary-...``. Both live inside the SMS dialog scope, so
+    we scope-then-match like we do for the input.
+
+    Match strategies in order (each scoped to the SMS dialog):
+      A. ARIA role=button name=验证 — works if 抖音 ever fixes accessibility
+      B. ``.uc_verification_component_btn-...`` class — 抖音's verification
+         component prefix; combined with primary-* picks the submit button
+         specifically (not「取消」)
+      C. Any element with exact inner_text == "验证" — last resort
     """
     target = None
     matched_label = None
     for scope_label, scope in await _find_sms_dialog_scopes(page):
-        # Strategy A: ARIA role + name inside this dialog.
+        # Strategy A: ARIA role (would be ideal if 抖音 added role="button").
         try:
             loc = scope.get_by_role("button", name="验证", exact=True).first
             if await loc.count() > 0 and await loc.is_visible():
@@ -450,25 +463,45 @@ async def _click_sms_submit(page) -> bool:
                 break
         except Exception:
             logger.debug("get_by_role 验证 button failed (scope=%s)", scope_label, exc_info=True)
-        # Strategy B: enumerate visible <button> in this scope, match
-        # inner_text == "验证" exactly.
+
+        # Strategy B: 抖音 verification-component class. The class name has
+        # a hash suffix (uc_verification_component_btn-EQNDAT) so we use a
+        # prefix-matcher. ``primary-*`` filters to the submit (not 取消).
         try:
-            buttons = scope.locator("button:visible")
-            n = await buttons.count()
-            for j in range(min(n, 20)):
-                btn = buttons.nth(j)
-                try:
-                    txt = (await btn.inner_text()).strip()
-                    if txt == "验证":
-                        target = btn
-                        matched_label = f"{scope_label} → button:visible[inner_text='验证']"
-                        break
-                except Exception:
-                    pass
-            if target is not None:
+            loc = scope.locator(
+                '[class*="uc_verification_component_btn-"][class*="primary-"]'
+            ).first
+            if await loc.count() > 0 and await loc.is_visible():
+                target = loc
+                matched_label = f"{scope_label} → uc_verification_component_btn[primary]"
                 break
         except Exception:
-            pass
+            logger.debug("uc_verification_component_btn lookup failed", exc_info=True)
+
+        # Strategy C: any element whose inner_text is exactly "验证".
+        # Avoids "验证码" / "验证失败" / "验证码登录" via exact match. We
+        # check several common inline-clickable element types — covers
+        # the <div> case 抖音 actually uses + future div→button changes.
+        for tag in ("div", "span", "button", "a"):
+            try:
+                els = scope.locator(f"{tag}:visible")
+                n = await els.count()
+                for j in range(min(n, 30)):
+                    el = els.nth(j)
+                    try:
+                        txt = (await el.inner_text()).strip()
+                        if txt == "验证":
+                            target = el
+                            matched_label = f"{scope_label} → {tag}:visible[inner_text='验证']"
+                            break
+                    except Exception:
+                        pass
+                if target is not None:
+                    break
+            except Exception:
+                pass
+        if target is not None:
+            break
 
     if target is None:
         logger.warning("SMS submit: no '验证' button found in any dialog scope")
@@ -481,20 +514,30 @@ async def _click_sms_submit(page) -> bool:
         # is bound to the input's validity state (length === maxlength)
         # which their React code re-evaluates on the next tick after
         # the keystroke handler runs.
+        #
+        # 抖音's submit isn't a real <button>, it's a <div> — so
+        # is_enabled() will always be True (no disabled attribute on a
+        # div). Their disabled state is encoded in a class suffix like
+        # ``disabled-XXX``. Best we can do is poll the class for a brief
+        # window; if it never goes from disabled → enabled we click anyway
+        # because the alternative (hard-fail) is worse for the user.
+        import asyncio
         try:
             for _ in range(15):  # 15 * 200ms = 3s
-                if await target.is_enabled():
+                try:
+                    cls = await target.get_attribute("class") or ""
+                except Exception:
+                    cls = ""
+                if "disabled" not in cls.lower():
                     break
-                import asyncio
                 await asyncio.sleep(0.2)
             else:
-                logger.warning(
-                    "SMS submit: 验证 button never enabled after 3s — "
-                    "input may be missing digits or stuck in invalid state",
+                logger.info(
+                    "SMS submit: button class still contains 'disabled' "
+                    "after 3s — clicking anyway",
                 )
-                return False
         except Exception:
-            logger.debug("is_enabled poll failed", exc_info=True)
+            logger.debug("disabled-class poll failed", exc_info=True)
         await target.click(timeout=5000)
         logger.info("SMS submit '验证' button clicked")
         return True
