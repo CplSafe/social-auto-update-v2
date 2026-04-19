@@ -130,7 +130,41 @@ async def _detect_sms_step(page) -> Literal["chooser", "input"] | None:
       3. Chooser-page markers (login flow only).
     """
     try:
-        # Strategy 1: stable id check — covers both login & publish flows.
+        # Strategy 1 (PRIMARY): JS-based detection mirroring the
+        # devtools-verified pattern. We look for *any* element among the
+        # likely modal containers whose innerText includes 「接收短信验证码」.
+        # This is the most reliable signal because:
+        #   - The title text is identical across both login and publish flows.
+        #   - Walking with `[...querySelectorAll('#uc-second-verify, article,
+        #     [role="dialog"], div')].find(el => innerText.includes(...))`
+        #     is robust against React-induced text-node splits that defeat
+        #     Playwright's get_by_text() locator.
+        #   - is_visible() on the modal root sometimes returns false during
+        #     mount transitions; checking innerText sidesteps that.
+        try:
+            has_modal_title = await page.evaluate(
+                """() => {
+                    const candidates = [
+                        ...document.querySelectorAll(
+                            '#uc-second-verify, article, [role="dialog"], div'
+                        ),
+                    ];
+                    return candidates.some(
+                        el => el.innerText && el.innerText.includes('接收短信验证码')
+                    );
+                }"""
+            )
+            if has_modal_title:
+                logger.info(
+                    "SMS challenge detected: step=input (via JS title probe '接收短信验证码')",
+                )
+                return "input"
+        except Exception:
+            logger.debug("JS title probe failed", exc_info=True)
+
+        # Strategy 2: stable id check — covers both login & publish flows.
+        # Kept as fallback in case JS evaluation is blocked or the modal
+        # mounted but hasn't rendered the title yet.
         try:
             modal = page.locator("#uc-second-verify").first
             if await modal.count() > 0 and await modal.is_visible():
@@ -141,7 +175,7 @@ async def _detect_sms_step(page) -> Literal["chooser", "input"] | None:
         except Exception:
             logger.debug("#uc-second-verify probe failed", exc_info=True)
 
-        # Strategy 2: text-marker fallback for any future modal variant
+        # Strategy 3: text-marker fallback for any future modal variant
         # that doesn't carry the id (or uses a different one).
         for marker in _SMS_INPUT_PAGE_MARKERS:
             if await page.get_by_text(marker).count() > 0:
@@ -395,296 +429,165 @@ async def _find_sms_dialog_scopes(page) -> list[tuple[str, Any]]:
 async def _fill_sms_code(page, code: str) -> bool:
     """Fill the SMS verification code into 抖音's input field.
 
-    抖音 input observed in the wild:
+    Uses the devtools-verified pattern: native HTMLInputElement value
+    setter + dispatched input/change events. This bypasses React's
+    SyntheticEvent system entirely, which is necessary because Semi
+    Design's controlled input frequently drops Playwright's
+    keyboard-driven keystrokes (per-digit setState clobber).
 
-        <input name="button-input" id="button-input" type="tel"
-               class="input-lrnhMm" placeholder="请输入验证码"
-               autocomplete="off" maxlength="6" ...>
+    The JS mirror of this function:
 
-    The id is stable. We pick exactly ONE input (no candidate fan-out)
-    and use a single focus → select-all → keyboard.type sequence so the
-    SPA's onChange handlers fire on every keystroke. fill() is unreliable
-    because Semi Design's controlled input intercepts the synthesized
-    React event and frequently drops it.
+        const modal = [...document.querySelectorAll(
+            '#uc-second-verify, article, [role="dialog"], div'
+        )].find(el => el.innerText && el.innerText.includes('接收短信验证码'));
+        const input = modal?.querySelector(
+            'input[placeholder="请输入验证码"], input, textarea'
+        );
+        const setter = Object.getOwnPropertyDescriptor(
+            HTMLInputElement.prototype, 'value'
+        ).set;
+        setter.call(input, code);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
 
-    Returns True only when the value reads back as the code we wrote.
+    Returns True if the JS reports the value landed in the DOM.
     """
-    # CRITICAL: 抖音 renders the underlying creator/login page AND the SMS
-    # dialog in the same DOM tree. Without scoping, ``.first`` picks the
-    # input on the underlying page (earlier in document order) — fill
-    # writes invisibly, user-visible modal stays empty. _find_sms_dialog_scopes
-    # returns scopes guaranteed to be inside the modal.
-    target = None
-    matched_selector = None
-    selector_candidates = (
-        'input#button-input',                  # 抖音 — stable id
-        'input[placeholder="请输入验证码"]',   # 抖音 — exact placeholder
-        'input[type="tel"][maxlength="6"]',    # generic OTP fallback
-    )
-    for scope_label, scope in await _find_sms_dialog_scopes(page):
-        for sel in selector_candidates:
-            try:
-                loc = scope.locator(sel).first
-                if await loc.count() > 0 and await loc.is_visible():
-                    target = loc
-                    matched_selector = f"{scope_label} → {sel}"
-                    break
-            except Exception:
-                logger.debug(
-                    "selector probe failed: scope=%s sel=%s",
-                    scope_label, sel, exc_info=True,
-                )
-        if target is not None:
-            break
-
-    if target is None:
-        logger.warning("SMS fill: no visible code input found in any dialog scope")
-        return False
-
     try:
-        import asyncio
-        await target.scroll_into_view_if_needed(timeout=2000)
-
-        # Read pre-state so we can see if the field already has stale data
-        # (debugging notes mentioned the field stuck at "123" between attempts).
-        try:
-            pre_value = (await target.input_value(timeout=1000)).strip()
-        except Exception:
-            pre_value = "<unreadable>"
+        result = await page.evaluate(
+            """(code) => {
+                const modal = [...document.querySelectorAll(
+                    '#uc-second-verify, article, [role="dialog"], div'
+                )].find(el => el.innerText && el.innerText.includes('接收短信验证码'));
+                if (!modal) return { ok: false, detail: 'modal-not-found' };
+                const input = modal.querySelector(
+                    'input[placeholder="请输入验证码"], input, textarea'
+                );
+                if (!input) return { ok: false, detail: 'input-not-found' };
+                // Native setter bypasses React's SyntheticEvent intercept.
+                const proto = (input.tagName === 'TEXTAREA')
+                    ? HTMLTextAreaElement.prototype
+                    : HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                setter.call(input, code);
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                return { ok: true, detail: 'value=' + input.value };
+            }""",
+            code,
+        )
+        ok = bool(result and result.get("ok"))
         logger.info(
-            "SMS fill pre-state: selector=%s pre_value=%r target_code=%r",
-            matched_selector, pre_value, code,
+            "SMS fill (JS native-setter): ok=%s detail=%s code_len=%d",
+            ok, (result or {}).get("detail"), len(code),
         )
-
-        # Step 1: focus.
-        await target.click(timeout=2000)
-
-        # Step 2: clear. fill("") is the single most reliable reset for a
-        # controlled React input — one synthetic change event with empty
-        # value. Falls back to keyboard select-all+backspace.
-        try:
-            await target.fill("", timeout=2000)
-        except Exception:
-            logger.debug("fill('') failed, trying select-all+backspace")
-            try:
-                await page.keyboard.press("ControlOrMeta+a")
-                await page.keyboard.press("Backspace")
-            except Exception:
-                pass
-
-        # Re-focus in case fill('') blurred us.
-        await target.click(timeout=1000)
-
-        # Step 3: type each digit individually, logging the input value
-        # after every keystroke so we can see exactly which keystroke
-        # gets dropped if any.
-        for i, ch in enumerate(code):
-            await page.keyboard.press(ch, delay=120)
-            try:
-                cur = (await target.input_value(timeout=500)).strip()
-            except Exception:
-                cur = "<unreadable>"
-            logger.info(
-                "SMS fill keystroke %d/%d: pressed=%r value_now=%r",
-                i + 1, len(code), ch, cur,
-            )
-
-        # Settle delay — let any debounced React state update flush.
-        await asyncio.sleep(0.3)
-
-        # Verify the value actually landed.
-        actual = (await target.input_value(timeout=2000)).strip()
-        if actual == code:
-            logger.info(
-                "SMS code filled successfully (selector=%s length=%d)",
-                matched_selector, len(code),
-            )
-            return True
-        logger.warning(
-            "SMS code fill verification failed (selector=%s): wrote %r, read %r",
-            matched_selector, code, actual,
-        )
-        return False
+        return ok
     except Exception:
-        logger.warning("SMS fill exception", exc_info=True)
+        logger.warning("SMS fill (JS) exception", exc_info=True)
         return False
 
 
 async def _click_sms_trigger(page) -> bool:
     """Click the「获取验证码」/「重新发送」trigger inside the SMS dialog.
 
-    Two button-text variants we care about:
-      - 「获取验证码」: dialog just opened (publish flow), no SMS sent yet.
-      - 「重新发送」: in input page after first SMS sent (login flow),
-        clickable only after the 60s countdown ends.
+    Devtools-verified pattern (JS):
 
-    Both share the same DOM shape as the chooser-row「接收短信验证码」:
-    a deeply-nested element holding the visible text. Reuses the same
-    text-engine + ancestor-walk strategy used in _click_chooser_row,
-    but scoped to the SMS dialog so we don't accidentally click a
-    similarly-named button on the underlying creator page.
+        const modal = document.querySelector('#uc-second-verify');
+        const getCodeBtn = [...modal.querySelectorAll('*')].find(el =>
+            (el.textContent || '').trim() === '获取验证码' &&
+            el.className?.includes('uc-ui-typography_description')
+        );
+        getCodeBtn.click();
+
+    The actual clickable element is a `<span>` with the
+    ``uc-ui-typography_description`` class — direct ``.click()`` on it
+    works. We try「获取验证码」first (publish-flow entry, no SMS sent
+    yet), then「重新发送」(login-flow countdown trigger).
     """
-    for label in ("获取验证码", "重新发送"):
-        for scope_label, scope in await _find_sms_dialog_scopes(page):
-            try:
-                text_loc = scope.get_by_text(label, exact=True).first
-                if await text_loc.count() == 0:
-                    continue
-                if not await text_loc.is_visible():
-                    continue
-                # Walk up to the nearest clickable ancestor (covers
-                # 抖音's <span>-with-onClick row + <div>-as-button cases).
-                clickable_xpath = (
-                    "ancestor-or-self::*[@role='button' or "
-                    "name()='button' or "
-                    "contains(@style, 'cursor: pointer') or "
-                    "contains(@class, 'btn') or "
-                    "contains(@class, 'button') or "
-                    "contains(@class, 'item')][1]"
-                )
-                ancestor = text_loc.locator(f"xpath={clickable_xpath}").first
-                target = ancestor if await ancestor.count() > 0 else text_loc
-                # Don't click if it's in a disabled state — many countdown
-                # buttons keep the text but add a disabled class.
-                try:
-                    cls = await target.get_attribute("class") or ""
-                    if "disabled" in cls.lower():
-                        logger.info(
-                            "SMS trigger: '%s' present but disabled (countdown?)",
-                            label,
-                        )
-                        return False
-                except Exception:
-                    pass
-                await target.scroll_into_view_if_needed(timeout=2000)
-                await target.click(timeout=5000)
-                logger.info(
-                    "SMS trigger clicked: %s (scope=%s, label=%s)",
-                    label, scope_label, label,
-                )
-                return True
-            except Exception:
-                logger.debug(
-                    "SMS trigger attempt failed: scope=%s label=%s",
-                    scope_label, label, exc_info=True,
-                )
-    logger.warning("SMS trigger: neither「获取验证码」nor「重新发送」found in any dialog scope")
-    return False
+    try:
+        result = await page.evaluate(
+            """() => {
+                const modal = document.querySelector('#uc-second-verify');
+                if (!modal) return { ok: false, detail: 'modal-not-found' };
+                // Strict match (DevTools-verified): the actual clickable
+                // <span> carries class ``uc-ui-typography_description``.
+                // Without this filter .find() may return an outer wrapper
+                // that has the text but no onClick, so .click() is a no-op.
+                for (const label of ['获取验证码', '重新发送']) {
+                    const strict = [...modal.querySelectorAll('*')].find(el =>
+                        (el.textContent || '').trim() === label &&
+                        (el.className || '').toString().includes('uc-ui-typography_description')
+                    );
+                    const btn = strict || [...modal.querySelectorAll('*')].find(el =>
+                        (el.textContent || '').trim() === label
+                    );
+                    if (!btn) continue;
+                    const cls = (btn.className || '').toString().toLowerCase();
+                    if (cls.includes('disabled')) {
+                        return { ok: false, detail: 'disabled-' + label };
+                    }
+                    btn.click();
+                    return {
+                        ok: true,
+                        detail: (strict ? 'strict-' : 'loose-') + 'clicked-' + label,
+                    };
+                }
+                return { ok: false, detail: 'no-trigger-found' };
+            }"""
+        )
+        ok = bool(result and result.get("ok"))
+        logger.info(
+            "SMS trigger (JS): ok=%s detail=%s",
+            ok, (result or {}).get("detail"),
+        )
+        return ok
+    except Exception:
+        logger.warning("SMS trigger (JS) exception", exc_info=True)
+        return False
 
 
 async def _click_sms_submit(page) -> bool:
     """Click the「验证」/ submit button on the SMS input page.
 
-    抖音's submit "button" is NOT a <button> element — it's a plain <div>
-    with class ``uc_verification_component_btn-...`` and the literal text
-    "验证". Confirmed via DOM dump:
+    Devtools-verified pattern (JS):
 
-        <div class="uc_verification_component_btn-EQNDAT
-                    content-Fpuout primary-Npo6wt large-WT6qX5">验证</div>
+        const modal = document.querySelector('#uc-second-verify');
+        const verifyBtn = [...modal.querySelectorAll('*')].find(el =>
+            (el.textContent || '').trim() === '验证'
+        );
+        verifyBtn.click();
 
-    Sister「取消」button has the same class structure with ``secondary-...``
-    instead of ``primary-...``. Both live inside the SMS dialog scope, so
-    we scope-then-match like we do for the input.
-
-    Match strategies in order (each scoped to the SMS dialog):
-      A. ARIA role=button name=验证 — works if 抖音 ever fixes accessibility
-      B. ``.uc_verification_component_btn-...`` class — 抖音's verification
-         component prefix; combined with primary-* picks the submit button
-         specifically (not「取消」)
-      C. Any element with exact inner_text == "验证" — last resort
+    The actual element is a ``<div>`` with class
+    ``uc_verification_component_btn-XXX`` carrying the literal text
+    「验证」. Direct ``.click()`` on it works in DevTools. Exact-text
+    match avoids "验证码" / "验证失败" false hits, and the children-
+    inclusive ``querySelectorAll('*')`` walk handles the deep nesting
+    without needing ancestor walks.
     """
-    target = None
-    matched_label = None
-    for scope_label, scope in await _find_sms_dialog_scopes(page):
-        # Strategy A: ARIA role (would be ideal if 抖音 added role="button").
-        try:
-            loc = scope.get_by_role("button", name="验证", exact=True).first
-            if await loc.count() > 0 and await loc.is_visible():
-                target = loc
-                matched_label = f"{scope_label} → role=button[验证]"
-                break
-        except Exception:
-            logger.debug("get_by_role 验证 button failed (scope=%s)", scope_label, exc_info=True)
-
-        # Strategy B: 抖音 verification-component class. The class name has
-        # a hash suffix (uc_verification_component_btn-EQNDAT) so we use a
-        # prefix-matcher. ``primary-*`` filters to the submit (not 取消).
-        try:
-            loc = scope.locator(
-                '[class*="uc_verification_component_btn-"][class*="primary-"]'
-            ).first
-            if await loc.count() > 0 and await loc.is_visible():
-                target = loc
-                matched_label = f"{scope_label} → uc_verification_component_btn[primary]"
-                break
-        except Exception:
-            logger.debug("uc_verification_component_btn lookup failed", exc_info=True)
-
-        # Strategy C: any element whose inner_text is exactly "验证".
-        # Avoids "验证码" / "验证失败" / "验证码登录" via exact match. We
-        # check several common inline-clickable element types — covers
-        # the <div> case 抖音 actually uses + future div→button changes.
-        for tag in ("div", "span", "button", "a"):
-            try:
-                els = scope.locator(f"{tag}:visible")
-                n = await els.count()
-                for j in range(min(n, 30)):
-                    el = els.nth(j)
-                    try:
-                        txt = (await el.inner_text()).strip()
-                        if txt == "验证":
-                            target = el
-                            matched_label = f"{scope_label} → {tag}:visible[inner_text='验证']"
-                            break
-                    except Exception:
-                        pass
-                if target is not None:
-                    break
-            except Exception:
-                pass
-        if target is not None:
-            break
-
-    if target is None:
-        logger.warning("SMS submit: no '验证' button found in any dialog scope")
-        return False
-    logger.info("SMS submit target located: %s", matched_label)
-
     try:
-        await target.scroll_into_view_if_needed(timeout=2000)
-        # Wait up to 3s for the button to become enabled — 抖音's button
-        # is bound to the input's validity state (length === maxlength)
-        # which their React code re-evaluates on the next tick after
-        # the keystroke handler runs.
-        #
-        # 抖音's submit isn't a real <button>, it's a <div> — so
-        # is_enabled() will always be True (no disabled attribute on a
-        # div). Their disabled state is encoded in a class suffix like
-        # ``disabled-XXX``. Best we can do is poll the class for a brief
-        # window; if it never goes from disabled → enabled we click anyway
-        # because the alternative (hard-fail) is worse for the user.
-        import asyncio
-        try:
-            for _ in range(15):  # 15 * 200ms = 3s
-                try:
-                    cls = await target.get_attribute("class") or ""
-                except Exception:
-                    cls = ""
-                if "disabled" not in cls.lower():
-                    break
-                await asyncio.sleep(0.2)
-            else:
-                logger.info(
-                    "SMS submit: button class still contains 'disabled' "
-                    "after 3s — clicking anyway",
-                )
-        except Exception:
-            logger.debug("disabled-class poll failed", exc_info=True)
-        await target.click(timeout=5000)
-        logger.info("SMS submit '验证' button clicked")
-        return True
+        result = await page.evaluate(
+            """() => {
+                const modal = document.querySelector('#uc-second-verify');
+                if (!modal) return { ok: false, detail: 'modal-not-found' };
+                const verifyBtn = [...modal.querySelectorAll('*')].find(el =>
+                    (el.textContent || '').trim() === '验证'
+                );
+                if (!verifyBtn) return { ok: false, detail: 'no-verify-button' };
+                const cls = (verifyBtn.className || '').toString().toLowerCase();
+                if (cls.includes('disabled')) {
+                    return { ok: false, detail: 'disabled' };
+                }
+                verifyBtn.click();
+                return { ok: true, detail: 'clicked' };
+            }"""
+        )
+        ok = bool(result and result.get("ok"))
+        logger.info(
+            "SMS submit (JS): ok=%s detail=%s",
+            ok, (result or {}).get("detail"),
+        )
+        return ok
     except Exception:
-        logger.warning("SMS submit click exception", exc_info=True)
+        logger.warning("SMS submit (JS) exception", exc_info=True)
         return False
 
 

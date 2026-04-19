@@ -602,6 +602,12 @@ class DouYinVideo(DouYinBaseUploader):
                 douyin_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
                 break
             except Exception:
+                # P7 patch: 抖音 may insert the SMS verification modal AFTER
+                # the publish click — page won't navigate to /content/manage
+                # until the user (via dify) submits a code. Re-probe every
+                # retry so the callback gets invoked and we don't busy-loop
+                # for 30s while the modal sits up untouched.
+                await self._maybe_check_challenge(page)
                 await self.handle_auto_video_cover(page)
                 douyin_logger.info(_msg("🏃", "小人正在冲刺发布视频"))
                 if self.debug:

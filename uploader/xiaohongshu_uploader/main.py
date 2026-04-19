@@ -593,6 +593,9 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                 xiaohongshu_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
                 break
             except Exception:
+                # P7 patch: mirror DouYin — XHS may insert SMS modal after
+                # the publish click; re-probe each retry to surface to dify.
+                await self._maybe_check_challenge(page)
                 xiaohongshu_logger.info(_msg("🏃", "小人正在冲刺发布视频"))
                 if self.debug:
                     await page.screenshot(full_page=True)
