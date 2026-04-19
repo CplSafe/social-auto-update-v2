@@ -90,14 +90,39 @@ def make_challenge_callback(
                 except Exception:
                     logger.exception("on_session_created hook raised")
         else:
-            # Re-prompt scenario: reset the session back to awaiting_user
-            # so dify can collect a new code without confusion.
-            challenge_sessions.update(
-                state["session_id"],
-                status="awaiting_user",
-                pending_action=None,
-                last_result={"detail": "请重新获取/输入验证码"},
-            )
+            # Re-prompt scenario: caller's outer loop entered maybe_emit_challenge
+            # again for the same browser tab. The session might be in any state:
+            #
+            #   - "completed": we just consumed an action but the page DOM
+            #     hasn't fully cleared yet — DON'T reset, just bail and let
+            #     the outer loop sleep/retry. Otherwise we wipe the user's
+            #     just-submitted action and they get stuck waiting again.
+            #   - "aborted": already terminal, nothing to do.
+            #   - "awaiting_user" / "user_submitted": still in flight, leave
+            #     it alone; the poll loop below will pick up where it was.
+            current = challenge_sessions.get(state["session_id"])
+            if current is None:
+                # Session expired — start over.
+                state["session_id"] = None
+                logger.warning(
+                    "challenge session %s vanished between emits; recreating",
+                    state["session_id"],
+                )
+                # Recurse-style: re-call ourselves to create a fresh one.
+                return await callback(payload)
+            if current.status in ("completed", "aborted"):
+                # Last action already consumed; the DOM is the thing that
+                # didn't catch up. Return a noop so the outer loop bails out
+                # of maybe_emit_challenge cleanly without spawning a new
+                # dify modal prompt.
+                logger.info(
+                    "challenge_callback re-entered after %s session=%s; returning noop",
+                    current.status,
+                    state["session_id"],
+                )
+                return {"command": "noop"}
+            # Otherwise the session is still awaiting/submitted — fall
+            # through to the poll loop below; no reset needed.
 
         session_id = state["session_id"]
         logger.info(
@@ -110,8 +135,20 @@ def make_challenge_callback(
         # (slightly less than TTL) so the uploader gets a clean abort
         # before Redis evicts the session.
         deadline = asyncio.get_event_loop().time() + challenge_sessions.SESSION_WAIT_TIMEOUT_SECONDS
+        poll_count = 0
         while True:
             session = challenge_sessions.get(session_id)
+            poll_count += 1
+            if poll_count <= 3 or poll_count % 20 == 0:
+                # Log first few polls + every 30s thereafter so the operator
+                # can see the callback is alive and what it's reading.
+                logger.info(
+                    "challenge_callback poll #%d session=%s status=%s pending=%s",
+                    poll_count,
+                    session_id,
+                    session.status if session else "<none>",
+                    bool(session and session.pending_action),
+                )
             if session is None:
                 logger.warning(
                     "challenge session vanished — TTL expired before user responded",
@@ -129,8 +166,9 @@ def make_challenge_callback(
                     pending_action=None,
                 )
                 logger.info(
-                    "challenge_callback consumed user action",
-                    extra={"session_id": session_id, "command": action.get("command")},
+                    "challenge_callback consumed user action: session=%s command=%s",
+                    session_id,
+                    action.get("command"),
                 )
                 return action  # type: ignore[return-value]
 

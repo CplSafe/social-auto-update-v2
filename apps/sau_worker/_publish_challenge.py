@@ -385,11 +385,23 @@ async def maybe_emit_challenge(page, challenge_callback: ChallengeCallback | Non
         else:
             action = response_or_awaitable
 
-        if action is None or action.get("command") in (None, "noop"):
+        if action is None or action.get("command") is None:
+            # Callback returned nothing actionable — treat as abort so we
+            # don't busy-loop here.
             raise VerificationAbortedError(
                 kind="sms",
                 reason="callback returned no action",
             )
+
+        if action.get("command") == "noop":
+            # Callback explicitly chose to do nothing this round (typically
+            # because the previous action was already consumed and the DOM
+            # hasn't fully cleared). Bail out cleanly so the upstream caller's
+            # outer loop can sleep + re-poll the page state.
+            logger.debug(
+                "challenge_callback returned noop; exiting maybe_emit_challenge",
+            )
+            return
 
         if action.get("command") == "abort":
             raise VerificationAbortedError(
