@@ -600,37 +600,57 @@ async def _click_chooser_row(page) -> bool:
        it and on each ancestor until one of them advances the page.
     2. Playwright locator + ancestor xpath fallback.
     """
-    # Strategy 1: JS-driven click — most robust against 抖音 changing the
-    # row's clickable ancestor class names. We dispatch the click event
-    # on the text node's ancestors from innermost to outermost; the first
-    # one with an attached handler wins.
-    try:
-        clicked = await page.evaluate(
-            """
-            (label) => {
-                const all = Array.from(document.querySelectorAll('*'));
-                const candidates = all.filter(el =>
-                    el.children.length === 0 &&
-                    el.innerText &&
-                    el.innerText.trim() === label
-                );
-                if (candidates.length === 0) return false;
-                for (const leaf of candidates) {
-                    let cur = leaf;
-                    for (let depth = 0; depth < 6 && cur; depth++) {
-                        try {
-                            cur.click();
-                        } catch (e) {}
-                        cur = cur.parentElement;
-                    }
+    # Strategy 0: direct xpath — 抖音's chooser modal has a stable
+    # structure under #uc-second-verify. The first list row is the SMS
+    # option. Try this before the generic JS approach.
+    direct_xpath = '//*[@id="uc-second-verify"]/div/div/article/div[2]/div[3]/div[1]'
+    for frame in page.frames:
+        try:
+            loc = frame.locator(f"xpath={direct_xpath}").first
+            if await loc.count() > 0:
+                await loc.click(timeout=3000)
+                logger.info("chooser clicked via direct xpath in frame: %s", frame.url or "<main>")
+                await page.wait_for_timeout(800)
+                new_step = await _detect_sms_step(page)
+                if new_step == "input":
+                    return True
+        except Exception as exc:
+            logger.debug("direct xpath click failed in frame %s: %s", frame.url, exc)
+
+    # Strategy 1: JS-driven click across all frames (main + iframes).
+    # 抖音's SMS chooser is rendered inside a same-origin iframe (e.g.
+    # uc-second-verify), so page.evaluate alone misses it. We loop every
+    # frame, find leaf nodes matching the label, and dispatch click on
+    # each ancestor up to depth 6.
+    js_click = """
+        (label) => {
+            const all = Array.from(document.querySelectorAll('*'));
+            const candidates = all.filter(el =>
+                el.children.length === 0 &&
+                el.innerText &&
+                el.innerText.trim() === label
+            );
+            if (candidates.length === 0) return false;
+            for (const leaf of candidates) {
+                let cur = leaf;
+                for (let depth = 0; depth < 6 && cur; depth++) {
+                    try { cur.click(); } catch (e) {}
+                    cur = cur.parentElement;
                 }
-                return true;
             }
-            """,
-            _CHOOSER_ADVANCE_TEXT,
-        )
-        if clicked:
-            # Give the page a moment to navigate to the input step.
+            return true;
+        }
+    """
+    try:
+        clicked_any = False
+        for frame in page.frames:
+            try:
+                if await frame.evaluate(js_click, _CHOOSER_ADVANCE_TEXT):
+                    clicked_any = True
+                    logger.info("chooser JS-clicked in frame: %s", frame.url or "<main>")
+            except Exception as exc:
+                logger.debug("frame eval failed (%s): %s", frame.url, exc)
+        if clicked_any:
             await page.wait_for_timeout(800)
             new_step = await _detect_sms_step(page)
             if new_step == "input":
