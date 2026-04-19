@@ -248,6 +248,70 @@ async def _click_first_match(page, selectors: tuple[str, ...]) -> bool:
     return False
 
 
+async def _find_sms_dialog_scopes(page) -> list[tuple[str, Any]]:
+    """Find Locator scopes that are guaranteed inside the SMS dialog
+    (and NOT the underlying creator/login page that lives in the same
+    DOM but is overlaid by the modal).
+
+    Returns ``[(label, locator), ...]`` ordered by preference; callers
+    iterate until a child element search succeeds.
+
+    抖音 renders both the modal and the underlying page in the same
+    DOM tree. Inputs/buttons in the underlying page match the same
+    selectors as the modal, and ``.first`` picks the underlying one
+    because it appears earlier in document order. Scoping every
+    locator to the modal element fixes that.
+    """
+    scopes: list[tuple[str, Any]] = []
+    # Strategy A: ARIA role=dialog with the SMS dialog's name.
+    try:
+        d = page.get_by_role("dialog", name="接收短信验证码").first
+        if await d.count() > 0 and await d.is_visible():
+            scopes.append(("role=dialog[接收短信验证码]", d))
+    except Exception:
+        pass
+    # Strategy B: any visible role=dialog (covers cases where the dialog
+    # has no accessible name but is still aria-marked).
+    try:
+        d = page.get_by_role("dialog").first
+        if await d.count() > 0 and await d.is_visible():
+            # Don't append if it's the same node as Strategy A.
+            if not scopes or scopes[0][1] is not d:
+                scopes.append(("role=dialog", d))
+    except Exception:
+        pass
+    # Strategy C: anchor to the「短信已发送至」header text and walk up to
+    # the nearest <article> ancestor. The header text only appears
+    # inside the SMS dialog, so this gives us the right scope even
+    # when ARIA roles are missing.
+    try:
+        header = page.get_by_text("短信已发送至").first
+        if await header.count() > 0:
+            article = header.locator("xpath=ancestor::article[1]").first
+            if await article.count() > 0:
+                scopes.append(("article-ancestor[短信已发送至]", article))
+            else:
+                # If there's no article ancestor, fall back to the nearest
+                # ancestor with role=dialog or class containing modal/dialog.
+                fallback = header.locator(
+                    "xpath=ancestor::*[@role='dialog' or "
+                    "contains(@class,'modal') or contains(@class,'dialog')][1]"
+                ).first
+                if await fallback.count() > 0:
+                    scopes.append(("dialog-ish-ancestor[短信已发送至]", fallback))
+    except Exception:
+        pass
+    if not scopes:
+        # No scoped lookup possible — fall back to the page itself; the
+        # caller will log this and may still misfire.
+        logger.warning(
+            "SMS dialog scope: no scoped locator available; falling back to "
+            "page-level lookup which may match underlying-page elements",
+        )
+        scopes.append(("<page>", page))
+    return scopes
+
+
 async def _fill_sms_code(page, code: str) -> bool:
     """Fill the SMS verification code into 抖音's input field.
 
@@ -265,29 +329,36 @@ async def _fill_sms_code(page, code: str) -> bool:
 
     Returns True only when the value reads back as the code we wrote.
     """
-    # Locate exactly one input. Selectors in order of preference; first
-    # match wins. We do NOT fan out candidates — multiple writes to
-    # different inputs would clobber each other.
-    selector_candidates = (
-        'input#button-input',                    # 抖音 — stable id
-        'input[placeholder="请输入验证码"]',     # 抖音 — exact placeholder
-        'input[type="tel"][maxlength="6"]',      # 抖音 / generic 6-digit OTP
-    )
-
+    # CRITICAL: 抖音 renders the underlying creator/login page AND the SMS
+    # dialog in the same DOM tree. Without scoping, ``.first`` picks the
+    # input on the underlying page (earlier in document order) — fill
+    # writes invisibly, user-visible modal stays empty. _find_sms_dialog_scopes
+    # returns scopes guaranteed to be inside the modal.
     target = None
     matched_selector = None
-    for sel in selector_candidates:
-        try:
-            loc = page.locator(sel).first
-            if await loc.count() > 0 and await loc.is_visible():
-                target = loc
-                matched_selector = sel
-                break
-        except Exception:
-            logger.debug("selector probe failed: %s", sel, exc_info=True)
+    selector_candidates = (
+        'input#button-input',                  # 抖音 — stable id
+        'input[placeholder="请输入验证码"]',   # 抖音 — exact placeholder
+        'input[type="tel"][maxlength="6"]',    # generic OTP fallback
+    )
+    for scope_label, scope in await _find_sms_dialog_scopes(page):
+        for sel in selector_candidates:
+            try:
+                loc = scope.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    target = loc
+                    matched_selector = f"{scope_label} → {sel}"
+                    break
+            except Exception:
+                logger.debug(
+                    "selector probe failed: scope=%s sel=%s",
+                    scope_label, sel, exc_info=True,
+                )
+        if target is not None:
+            break
 
     if target is None:
-        logger.warning("SMS fill: no visible code input found on page")
+        logger.warning("SMS fill: no visible code input found in any dialog scope")
         return False
 
     try:
@@ -362,30 +433,27 @@ async def _fill_sms_code(page, code: str) -> bool:
 async def _click_sms_submit(page) -> bool:
     """Click the「验证」/ submit button on the SMS input page.
 
-    抖音 wraps buttons in deeply-nested Semi Design markup. The submit
-    button's accessible name is just "验证" but the literal `<button>`
-    element has its label in a nested `<span>`. ``get_by_role`` is the
-    most reliable matcher here because it walks the accessibility tree.
-
-    Pre-flight: wait for the button to be enabled. 抖音 disables it
-    until the input has the right number of digits; if we click while
-    still disabled, nothing happens and we report ok=True misleadingly.
+    Like _fill_sms_code, must scope to the SMS dialog because the
+    underlying creator login page also has buttons that match "验证"
+    (e.g. "验证码登录" tab on the password form). Without scoping,
+    .first picks one of those and we click into the wrong page.
     """
-    # Single best-effort locator: ARIA role + accessible name. Falls
-    # back to a tight CSS only if get_by_role misses.
     target = None
-    try:
-        loc = page.get_by_role("button", name="验证", exact=True).first
-        if await loc.count() > 0:
-            target = loc
-    except Exception:
-        logger.debug("get_by_role for 验证 button failed", exc_info=True)
-
-    if target is None:
-        # Fallback: enumerate visible buttons and match inner_text == "验证"
-        # exactly so we don't pick "验证码" / "验证失败" / etc.
+    matched_label = None
+    for scope_label, scope in await _find_sms_dialog_scopes(page):
+        # Strategy A: ARIA role + name inside this dialog.
         try:
-            buttons = page.locator("button:visible")
+            loc = scope.get_by_role("button", name="验证", exact=True).first
+            if await loc.count() > 0 and await loc.is_visible():
+                target = loc
+                matched_label = f"{scope_label} → role=button[验证]"
+                break
+        except Exception:
+            logger.debug("get_by_role 验证 button failed (scope=%s)", scope_label, exc_info=True)
+        # Strategy B: enumerate visible <button> in this scope, match
+        # inner_text == "验证" exactly.
+        try:
+            buttons = scope.locator("button:visible")
             n = await buttons.count()
             for j in range(min(n, 20)):
                 btn = buttons.nth(j)
@@ -393,15 +461,19 @@ async def _click_sms_submit(page) -> bool:
                     txt = (await btn.inner_text()).strip()
                     if txt == "验证":
                         target = btn
+                        matched_label = f"{scope_label} → button:visible[inner_text='验证']"
                         break
                 except Exception:
                     pass
+            if target is not None:
+                break
         except Exception:
             pass
 
     if target is None:
-        logger.warning("SMS submit: no button matching '验证' found")
+        logger.warning("SMS submit: no '验证' button found in any dialog scope")
         return False
+    logger.info("SMS submit target located: %s", matched_label)
 
     try:
         await target.scroll_into_view_if_needed(timeout=2000)
