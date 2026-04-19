@@ -91,10 +91,14 @@ _SMS_CHOOSER_MARKERS = (
 )
 _SMS_CHOOSER_MIN_MARKERS = 2
 
-# STEP B: 「接收短信验证码」输入页关键字。「短信已发送至」是这一页的
-# 强特征（其他页面不会出现），单独命中即可；其他作为后备。
+# STEP B: 「接收短信验证码」输入页关键字。两种 variant 都要覆盖：
+#   - 登录路径：进 input 页时已自动发送 SMS，header 显示「短信已发送至 ***」
+#   - 发布路径：直接弹「接收短信验证码」弹窗，header 是「请输入当前手机号
+#     177***** 收到的短信验证码」，需要用户先点「获取验证码」才会发送
+# 任一关键字命中即可识别为 input 页面。
 _SMS_INPUT_PAGE_MARKERS = (
     "短信已发送至",
+    "请输入当前手机号",
     "请输入验证码",
     "请输入手机号收到的",
 )
@@ -430,6 +434,68 @@ async def _fill_sms_code(page, code: str) -> bool:
         return False
 
 
+async def _click_sms_trigger(page) -> bool:
+    """Click the「获取验证码」/「重新发送」trigger inside the SMS dialog.
+
+    Two button-text variants we care about:
+      - 「获取验证码」: dialog just opened (publish flow), no SMS sent yet.
+      - 「重新发送」: in input page after first SMS sent (login flow),
+        clickable only after the 60s countdown ends.
+
+    Both share the same DOM shape as the chooser-row「接收短信验证码」:
+    a deeply-nested element holding the visible text. Reuses the same
+    text-engine + ancestor-walk strategy used in _click_chooser_row,
+    but scoped to the SMS dialog so we don't accidentally click a
+    similarly-named button on the underlying creator page.
+    """
+    for label in ("获取验证码", "重新发送"):
+        for scope_label, scope in await _find_sms_dialog_scopes(page):
+            try:
+                text_loc = scope.get_by_text(label, exact=True).first
+                if await text_loc.count() == 0:
+                    continue
+                if not await text_loc.is_visible():
+                    continue
+                # Walk up to the nearest clickable ancestor (covers
+                # 抖音's <span>-with-onClick row + <div>-as-button cases).
+                clickable_xpath = (
+                    "ancestor-or-self::*[@role='button' or "
+                    "name()='button' or "
+                    "contains(@style, 'cursor: pointer') or "
+                    "contains(@class, 'btn') or "
+                    "contains(@class, 'button') or "
+                    "contains(@class, 'item')][1]"
+                )
+                ancestor = text_loc.locator(f"xpath={clickable_xpath}").first
+                target = ancestor if await ancestor.count() > 0 else text_loc
+                # Don't click if it's in a disabled state — many countdown
+                # buttons keep the text but add a disabled class.
+                try:
+                    cls = await target.get_attribute("class") or ""
+                    if "disabled" in cls.lower():
+                        logger.info(
+                            "SMS trigger: '%s' present but disabled (countdown?)",
+                            label,
+                        )
+                        return False
+                except Exception:
+                    pass
+                await target.scroll_into_view_if_needed(timeout=2000)
+                await target.click(timeout=5000)
+                logger.info(
+                    "SMS trigger clicked: %s (scope=%s, label=%s)",
+                    label, scope_label, label,
+                )
+                return True
+            except Exception:
+                logger.debug(
+                    "SMS trigger attempt failed: scope=%s label=%s",
+                    scope_label, label, exc_info=True,
+                )
+    logger.warning("SMS trigger: neither「获取验证码」nor「重新发送」found in any dialog scope")
+    return False
+
+
 async def _click_sms_submit(page) -> bool:
     """Click the「验证」/ submit button on the SMS input page.
 
@@ -612,15 +678,18 @@ async def perform_sms_action(page, action: ChallengeAction) -> dict[str, Any]:
     """
     command = action.get("command")
     if command == "trigger_sms":
-        # On 抖音 the first SMS is already auto-dispatched when we land on
-        # the input page, so this is effectively a「重新发送」. The button
-        # is disabled during the 60s countdown — clicking before then is
-        # a no-op as far as the platform is concerned, but our selector
-        # match still returns True. Detail message reflects that nuance.
-        ok = await _click_first_match(page, _TRIGGER_SMS_SELECTORS)
+        # Two scenarios on 抖音:
+        #   - Login flow: SMS already auto-dispatched on input-page entry,
+        #     so trigger_sms is effectively「重新发送」(disabled during 60s
+        #     countdown).
+        #   - Publish flow: dialog opens with NO SMS sent yet, user has
+        #     to click「获取验证码」first.
+        # _click_sms_trigger handles both — scopes to the SMS dialog and
+        # tries「获取验证码」/「重新发送」labels in order.
+        ok = await _click_sms_trigger(page)
         return {
             "ok": ok,
-            "detail": "重新发送已触发" if ok else "未找到「重新发送」按钮（可能仍在倒计时）",
+            "detail": "短信触发成功" if ok else "未找到「获取验证码」/「重新发送」按钮（可能仍在倒计时）",
         }
     if command == "submit_code":
         code = (action.get("code") or "").strip()
