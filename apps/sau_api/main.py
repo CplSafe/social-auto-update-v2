@@ -1,7 +1,15 @@
 import logging
 import os
+import sys
+from pathlib import Path
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+
+# Ensure project root is on sys.path so upstream `conf` module is importable
+# regardless of how the process is launched (uv run, direct venv, etc.)
+_project_root = str(Path(__file__).parent.parent.parent.resolve())
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 from fastapi import Depends, FastAPI
 
