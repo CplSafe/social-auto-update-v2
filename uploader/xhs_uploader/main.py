@@ -6,7 +6,11 @@ from time import sleep
 import requests
 from playwright.sync_api import sync_playwright
 
-from conf import BASE_DIR, XHS_SERVER, LOCAL_CHROME_HEADLESS
+try:
+    from conf import BASE_DIR
+except ModuleNotFoundError:
+    from pathlib import Path
+    BASE_DIR = Path(__file__).parent.parent.parent.resolve(), XHS_SERVER, LOCAL_CHROME_HEADLESS
 
 config = configparser.RawConfigParser()
 config.read('accounts.ini')
