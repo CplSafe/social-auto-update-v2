@@ -124,18 +124,27 @@ async def _detect_sms_step(page) -> Literal["chooser", "input"] | None:
         # STEP B (input page) — strong single marker.
         for marker in _SMS_INPUT_PAGE_MARKERS:
             if await page.get_by_text(marker).count() > 0:
+                logger.info(
+                    "SMS challenge detected: step=input (marker=%r)",
+                    marker,
+                )
                 return "input"
         # STEP A (chooser page) — needs both markers to avoid matching a
         # generic page that just mentions "身份验证" in some help text.
-        hits = 0
+        hits: list[str] = []
         for marker in _SMS_CHOOSER_MARKERS:
             if await page.get_by_text(marker).count() > 0:
-                hits += 1
-        if hits >= _SMS_CHOOSER_MIN_MARKERS:
+                hits.append(marker)
+        if len(hits) >= _SMS_CHOOSER_MIN_MARKERS:
+            logger.info(
+                "SMS challenge detected: step=chooser (markers=%s)",
+                hits,
+            )
             return "chooser"
         return None
     except Exception:
         # Page closed / navigated mid-check — treat as no challenge.
+        logger.debug("detect_sms_step raised", exc_info=True)
         return None
 
 
@@ -143,15 +152,13 @@ async def _detect_sms_step(page) -> Literal["chooser", "input"] | None:
 
 
 # STEP A → STEP B: the「接收短信验证码」row on the chooser page. Clicking
-# it advances to the input page; the chooser is just a router. Clickable
-# element on 抖音 isn't a real <button> — it's a div with role-ish
-# semantics, so :has-text matching is the most resilient.
-_CHOOSER_ADVANCE_SELECTORS = (
-    'button:has-text("接收短信验证码")',
-    'div[role="button"]:has-text("接收短信验证码")',
-    'div:has-text("接收短信验证码")',
-    'a:has-text("接收短信验证码")',
-)
+# it advances to the input page; the chooser is just a router. 抖音's
+# clickable row is a deeply-nested <div> tree without role/button
+# semantics, so we use Playwright's text engine (get_by_text) at click
+# time instead of CSS :has-text — text engine matches the leaf node
+# carrying the visible label, then we click() walks up to the nearest
+# clickable ancestor automatically.
+_CHOOSER_ADVANCE_TEXT = "接收短信验证码"
 
 # STEP B: the「重新发送」/ trigger-resend button. Initial entry to the
 # input page already dispatches one SMS automatically (the page header
@@ -200,6 +207,52 @@ async def _click_first_match(page, selectors: tuple[str, ...]) -> bool:
         except Exception:
             logger.debug("click attempt failed for selector %s", sel, exc_info=True)
     return False
+
+
+async def _click_chooser_row(page) -> bool:
+    """Click the「接收短信验证码」row on the chooser page.
+
+    抖音's row is a deep <div> tree where the visible text and the
+    clickable container are different nodes. ``get_by_text`` finds the
+    leaf carrying the label, then we walk up via xpath ancestor lookup
+    to find a clickable container (cursor:pointer, role=button, or just
+    the immediate flex row). Falls back to clicking the text leaf
+    directly — Playwright's ``click()`` already trampolines into the
+    nearest event-handling ancestor for us when it can.
+    """
+    text_loc = page.get_by_text(_CHOOSER_ADVANCE_TEXT, exact=True).first
+    try:
+        if await text_loc.count() == 0:
+            # Fallback to non-exact match — abrupt whitespace / extra
+            # decoration around the label can break exact-match.
+            text_loc = page.get_by_text(_CHOOSER_ADVANCE_TEXT).first
+        if await text_loc.count() == 0:
+            return False
+        # Walk up to the nearest ancestor that looks clickable (covers
+        # 抖音's div-with-onClick rows). Falls back to the text leaf.
+        clickable_xpath = (
+            "ancestor-or-self::*[@role='button' or "
+            "contains(@style, 'cursor: pointer') or "
+            "contains(@class, 'item') or "
+            "contains(@class, 'card') or "
+            "contains(@class, 'row')][1]"
+        )
+        clickable = text_loc.locator(f"xpath={clickable_xpath}").first
+        target = clickable if await clickable.count() > 0 else text_loc
+        try:
+            await target.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+        await target.click(timeout=5000)
+        return True
+    except Exception as exc:
+        logger.warning("chooser row click failed: %s", exc, exc_info=True)
+        # Last-resort: try the text leaf directly without ancestor walking.
+        try:
+            await text_loc.click(timeout=3000)
+            return True
+        except Exception:
+            return False
 
 
 async def _fill_first_match(page, selectors: tuple[str, ...], value: str) -> bool:
@@ -300,19 +353,20 @@ async def maybe_emit_challenge(page, challenge_callback: ChallengeCallback | Non
                     reason="chooser page advance failed repeatedly",
                 )
             advance_count += 1
-            advanced = await _click_first_match(page, _CHOOSER_ADVANCE_SELECTORS)
+            advanced = await _click_chooser_row(page)
             if not advanced:
                 logger.warning(
-                    "chooser page detected but「接收短信验证码」button not found",
+                    "chooser page detected but「接收短信验证码」row not clickable",
                 )
                 raise VerificationAbortedError(
                     kind="sms",
                     reason="chooser advance button missing",
                 )
+            logger.info("clicked chooser「接收短信验证码」, waiting for SPA navigation")
             # Give the SPA a beat to navigate before re-detecting.
             try:
                 import asyncio
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(2.0)
             except Exception:
                 pass
             continue
