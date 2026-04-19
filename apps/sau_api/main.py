@@ -9,6 +9,19 @@ from apps.sau_api.deps import verify_sau_token
 from apps.sau_api.login_sessions import registry
 from apps.sau_api.routers import accounts, challenge, health, login_sse, publish, tasks
 
+# Make our own loggers (apps.*, uploader.*) visible at the uvicorn console.
+# Without this, uvicorn's default logging config swallows everything that
+# isn't `uvicorn.access`, so our SMS challenge diagnostics ("step=chooser",
+# "consumed user action", etc.) never show up — which makes flow debugging
+# impossible. Setting it on the root logger is the simplest reach-all.
+# Honour SAU_LOG_LEVEL so prod can dial it back to WARNING.
+_log_level = os.getenv("SAU_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=_log_level,
+    format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+
 logger = logging.getLogger(__name__)
 
 
