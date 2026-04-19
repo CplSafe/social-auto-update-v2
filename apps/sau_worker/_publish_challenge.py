@@ -68,65 +68,119 @@ ChallengeCallback = Callable[
 
 
 # ---------- detection ----------
+#
+# 抖音 SMS 验证是一个**两步**流程：
+#
+#   STEP A. 「身份验证」选择页：上面有「接收短信验证码」+「发送短信验证」
+#           两个选项 button。这只是一个跳转中间页，用户不需要看到。
+#   STEP B. 「接收短信验证码」输入页：上面有「短信已发送至 ***」+ 验证码
+#           输入框 + 验证按钮 + "58s 后重新发送" 倒计时。这是真正需要用户
+#           操作的页面（输入验证码）。
+#
+# 我们的策略：
+#   - 检测到 STEP A → ``perform_sms_action(advance_to_input)`` 自动点击
+#     「接收短信验证码」前进到 STEP B。这一步不暴露给 dify 用户。
+#   - 检测到 STEP B → 暴露给 dify。用户点 trigger_sms 让我们点「重新发送」
+#     （进 STEP B 已经自动发了一次，这个按钮是 60s 倒计时之后才能点）；
+#     或直接 submit_code 把验证码 fill 进去。
 
-# 短信验证页面 DOM 关键字。要求：
-# - 必须是显式提到「短信」「验证码」的字眼，避免误判普通登录页
-# - 同时出现 ≥ 2 个关键字才算命中（降低误判率）
-_SMS_MARKERS = (
-    "短信验证码",
-    "请输入手机号收到的",
-    "获取验证码",
-    "重新发送",
-    "请输入验证码",
+# STEP A: 「身份验证」选择页关键字。要求 2 个都命中（降低误判）。
+_SMS_CHOOSER_MARKERS = (
+    "身份验证",
+    "接收短信验证码",
 )
+_SMS_CHOOSER_MIN_MARKERS = 2
 
-# Minimum markers that must co-occur for an SMS challenge to be confirmed.
-# 1 marker is too lenient (the word "验证码" alone shows up on the login page);
-# 2 markers reliably signals "we're on a real SMS challenge page".
-_SMS_MIN_MARKERS = 2
+# STEP B: 「接收短信验证码」输入页关键字。「短信已发送至」是这一页的
+# 强特征（其他页面不会出现），单独命中即可；其他作为后备。
+_SMS_INPUT_PAGE_MARKERS = (
+    "短信已发送至",
+    "请输入验证码",
+    "请输入手机号收到的",
+)
 
 
 async def detect_sms_challenge(page) -> ChallengeKind | None:
-    """Return ``"sms"`` if the page is the SMS verification challenge.
+    """Return ``"sms"`` if the page is on either step of the SMS challenge.
 
-    Returns ``None`` if the page is anything else — the regular login QR,
-    the upload form, the publish progress screen, etc.
+    Distinguishes the two steps via :func:`_detect_sms_step` — see that
+    helper for the precise classification. Callers that only need a binary
+    "is this an SMS flow?" answer use this; callers that need to know
+    which step (chooser vs input page) call ``_detect_sms_step`` directly.
+    """
+    step = await _detect_sms_step(page)
+    return "sms" if step is not None else None
+
+
+async def _detect_sms_step(page) -> Literal["chooser", "input"] | None:
+    """Classify which step of the SMS challenge the page is on, or None.
+
+    The order matters: input-page detection runs first because the
+    chooser's '短信验证码' phrase is technically a substring of the input
+    page's '接收短信验证码' header — without ordering we'd false-positive
+    a chooser hit on an input page.
     """
     try:
+        # STEP B (input page) — strong single marker.
+        for marker in _SMS_INPUT_PAGE_MARKERS:
+            if await page.get_by_text(marker).count() > 0:
+                return "input"
+        # STEP A (chooser page) — needs both markers to avoid matching a
+        # generic page that just mentions "身份验证" in some help text.
         hits = 0
-        for marker in _SMS_MARKERS:
+        for marker in _SMS_CHOOSER_MARKERS:
             if await page.get_by_text(marker).count() > 0:
                 hits += 1
-                if hits >= _SMS_MIN_MARKERS:
-                    return "sms"
+        if hits >= _SMS_CHOOSER_MIN_MARKERS:
+            return "chooser"
         return None
     except Exception:
-        # Page closed / navigated mid-check — not a challenge, just retry next tick.
+        # Page closed / navigated mid-check — treat as no challenge.
         return None
 
 
 # ---------- page actions ----------
 
 
-# Selectors for the "get verification code" button on each platform's
-# challenge page. We try them in order; the first one that matches wins.
-_TRIGGER_SMS_SELECTORS = (
-    'button:has-text("获取验证码")',
-    'button:has-text("获取短信验证码")',
-    'a:has-text("获取验证码")',
-    '[role="button"]:has-text("获取验证码")',
+# STEP A → STEP B: the「接收短信验证码」row on the chooser page. Clicking
+# it advances to the input page; the chooser is just a router. Clickable
+# element on 抖音 isn't a real <button> — it's a div with role-ish
+# semantics, so :has-text matching is the most resilient.
+_CHOOSER_ADVANCE_SELECTORS = (
+    'button:has-text("接收短信验证码")',
+    'div[role="button"]:has-text("接收短信验证码")',
+    'div:has-text("接收短信验证码")',
+    'a:has-text("接收短信验证码")',
 )
 
-# Selectors for the SMS code input field. Prefer placeholder-based
-# matching since both platforms use it consistently.
+# STEP B: the「重新发送」/ trigger-resend button. Initial entry to the
+# input page already dispatches one SMS automatically (the page header
+# says "短信已发送至 ***" the moment you land); the user only ever needs
+# this button when the first SMS didn't arrive and the 60s countdown is
+# done.
+_TRIGGER_SMS_SELECTORS = (
+    'button:has-text("重新发送")',
+    'a:has-text("重新发送")',
+    'span:has-text("重新发送")',
+    # Legacy upstream selectors kept as a fallback for non-douyin platforms
+    # that may use different wording.
+    'button:has-text("获取验证码")',
+    'button:has-text("获取短信验证码")',
+)
+
+# STEP B: the SMS code input field. Prefer placeholder-based matching
+# since both platforms use it consistently.
 _SMS_INPUT_SELECTORS = (
+    'input[placeholder*="请输入验证码"]',
     'input[placeholder*="验证码"]',
     'input[type="tel"][maxlength="6"]',
     'input[type="text"][maxlength="6"]',
 )
 
-# Selectors for the "next" / "submit" button after entering the code.
+# STEP B: the「验证」/ submit button. 抖音's button literally says "验证";
+# other platforms or older flows may use "下一步" / "确定" / "提交".
 _SUBMIT_BUTTON_SELECTORS = (
+    'button:has-text("验证")',
     'button:has-text("下一步")',
     'button:has-text("确定")',
     'button:has-text("提交")',
@@ -168,10 +222,15 @@ async def perform_sms_action(page, action: ChallengeAction) -> dict[str, Any]:
     """
     command = action.get("command")
     if command == "trigger_sms":
+        # On 抖音 the first SMS is already auto-dispatched when we land on
+        # the input page, so this is effectively a「重新发送」. The button
+        # is disabled during the 60s countdown — clicking before then is
+        # a no-op as far as the platform is concerned, but our selector
+        # match still returns True. Detail message reflects that nuance.
         ok = await _click_first_match(page, _TRIGGER_SMS_SELECTORS)
         return {
             "ok": ok,
-            "detail": "短信触发成功" if ok else "未找到「获取验证码」按钮",
+            "detail": "重新发送已触发" if ok else "未找到「重新发送」按钮（可能仍在倒计时）",
         }
     if command == "submit_code":
         code = (action.get("code") or "").strip()
@@ -201,11 +260,10 @@ async def maybe_emit_challenge(page, challenge_callback: ChallengeCallback | Non
     no longer shows a challenge (callback succeeded) or the callback says
     to abort.
 
-    Designed to be called from inside the upstream upload() / login flow
-    at points where a challenge is most likely to surface (after page
-    navigation, before clicking publish, etc.). If no callback is wired
-    up, this is a single cheap DOM probe followed by an early return —
-    safe to sprinkle around.
+    抖音 splits the SMS flow into two pages (see ``_detect_sms_step``).
+    The chooser page (STEP A) is automatically advanced past — it's just
+    a router with no meaningful user choice for our use case. Only when
+    we reach the input page (STEP B) do we surface the challenge to dify.
 
     Raises ``VerificationAbortedError`` if the callback returns
     ``{"command": "abort"}``; the upstream caller should let it propagate
@@ -214,16 +272,58 @@ async def maybe_emit_challenge(page, challenge_callback: ChallengeCallback | Non
     if challenge_callback is None:
         return
 
-    # The callback loop runs until the challenge disappears OR the user
-    # aborts. We re-detect after each action because typing the wrong
-    # code keeps you on the same challenge page (need to retry); typing
-    # the right code clears it (we exit).
+    # Cap on auto-advance attempts so a flaky chooser-page selector can't
+    # spin forever burning DOM-query CPU.
+    max_advances = 3
+    advance_count = 0
+
+    # The loop runs until we leave the SMS challenge entirely OR the user
+    # aborts. After each user-side action we re-detect because:
+    #   - submit_code success → navigates away → detect returns None
+    #   - wrong code → stays on input page → re-prompt user
     while True:
-        kind = await detect_sms_challenge(page)
-        if kind is None:
+        step = await _detect_sms_step(page)
+        if step is None:
             return
 
-        payload: ChallengePayload = {"kind": kind, "page_url": page.url}
+        # STEP A: auto-click「接收短信验证码」to advance to the input page.
+        # No user interaction — the chooser page is a router, not a real
+        # decision point for our flow.
+        if step == "chooser":
+            if advance_count >= max_advances:
+                logger.warning(
+                    "exceeded max chooser-advance attempts (%d); aborting",
+                    max_advances,
+                )
+                raise VerificationAbortedError(
+                    kind="sms",
+                    reason="chooser page advance failed repeatedly",
+                )
+            advance_count += 1
+            advanced = await _click_first_match(page, _CHOOSER_ADVANCE_SELECTORS)
+            if not advanced:
+                logger.warning(
+                    "chooser page detected but「接收短信验证码」button not found",
+                )
+                raise VerificationAbortedError(
+                    kind="sms",
+                    reason="chooser advance button missing",
+                )
+            # Give the SPA a beat to navigate before re-detecting.
+            try:
+                import asyncio
+                await asyncio.sleep(1.5)
+            except Exception:
+                pass
+            continue
+
+        # STEP B: input page. Surface to dify so the user can submit the
+        # OTP. Note: 抖音 already auto-dispatches the SMS the moment we
+        # land on the input page (the header reads "短信已发送至 ***"),
+        # so the user can usually skip ``trigger_sms`` and go straight to
+        # ``submit_code``. They only need ``trigger_sms`` if the first
+        # SMS didn't arrive and the 60s countdown is up.
+        payload: ChallengePayload = {"kind": "sms", "page_url": page.url}
         response_or_awaitable = challenge_callback(payload)
         action: ChallengeAction | None
         if inspect.isawaitable(response_or_awaitable):
@@ -232,16 +332,14 @@ async def maybe_emit_challenge(page, challenge_callback: ChallengeCallback | Non
             action = response_or_awaitable
 
         if action is None or action.get("command") in (None, "noop"):
-            # Callback declined to handle — treat the challenge as fatal
-            # so we don't busy-loop here.
             raise VerificationAbortedError(
-                kind=kind,
+                kind="sms",
                 reason="callback returned no action",
             )
 
         if action.get("command") == "abort":
             raise VerificationAbortedError(
-                kind=kind,
+                kind="sms",
                 reason="user aborted",
             )
 
@@ -252,8 +350,8 @@ async def maybe_emit_challenge(page, challenge_callback: ChallengeCallback | Non
             result["ok"],
             result["detail"],
         )
-        # Loop: re-detect. If submit_code succeeded, the challenge page
-        # navigates away and detect returns None on the next pass.
+        # Loop: re-detect. If submit_code succeeded, the page navigates
+        # away and detect returns None on the next pass.
 
 
 # ---------- exceptions ----------
