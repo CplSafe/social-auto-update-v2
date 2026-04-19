@@ -163,7 +163,8 @@ async def start_login(req: LoginRequest) -> dict[str, Any]:
 
         poll_interval = int(os.getenv("SAU_LOGIN_POLL_INTERVAL_SEC", "3"))
         max_checks = int(os.getenv("SAU_LOGIN_MAX_CHECKS", "60"))
-        headless = os.getenv("SAU_LOGIN_HEADLESS", "1").lower() in ("1", "true", "yes")
+        # Default to headless. Only set SAU_LOGIN_HEADLESS=0 explicitly for local debug.
+        headless = os.getenv("SAU_LOGIN_HEADLESS", "1").strip().lower() not in ("0", "false", "no")
         try:
             result = await cookie_gen_fn(
                 str(cookie_path),
