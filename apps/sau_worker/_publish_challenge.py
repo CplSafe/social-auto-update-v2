@@ -252,6 +252,57 @@ async def _click_first_match(page, selectors: tuple[str, ...]) -> bool:
     return False
 
 
+async def _detect_sms_error(page) -> str | None:
+    """Return the text of any error tip 抖音 has rendered inside the SMS
+    dialog after a submit attempt, or None if there's no error.
+
+    抖音 puts wrong-code errors in a div with class
+    ``uc_verification_err_tip-XXX`` (suffix is hashed but the prefix is
+    stable). The element exists in the DOM whether or not there's an
+    error — when empty it has no text content. We only return non-empty
+    text content.
+    """
+    for scope_label, scope in await _find_sms_dialog_scopes(page):
+        try:
+            err = scope.locator('[class*="uc_verification_err_tip-"]').first
+            if await err.count() == 0:
+                continue
+            text = (await err.inner_text(timeout=1000)).strip()
+            if text:
+                logger.info(
+                    "SMS error tip detected (scope=%s): %r",
+                    scope_label, text,
+                )
+                return text
+        except Exception:
+            logger.debug(
+                "error-tip probe failed (scope=%s)", scope_label, exc_info=True,
+            )
+    # Fallback: look for inline red text via common Semi/抖音 error classes.
+    for sel in (
+        '[class*="error"]:visible',
+        '[class*="err-tip"]:visible',
+        '[class*="errorMessage"]:visible',
+    ):
+        try:
+            for scope_label, scope in await _find_sms_dialog_scopes(page):
+                loc = scope.locator(sel).first
+                if await loc.count() == 0:
+                    continue
+                text = (await loc.inner_text(timeout=1000)).strip()
+                # Filter out generic "no error" placeholders + truncate
+                # (some Semi error spans render the entire error code).
+                if text and len(text) <= 50:
+                    logger.info(
+                        "SMS error fallback hit (scope=%s sel=%s): %r",
+                        scope_label, sel, text,
+                    )
+                    return text
+        except Exception:
+            pass
+    return None
+
+
 async def _find_sms_dialog_scopes(page) -> list[tuple[str, Any]]:
     """Find Locator scopes that are guaranteed inside the SMS dialog
     (and NOT the underlying creator/login page that lives in the same
@@ -267,24 +318,32 @@ async def _find_sms_dialog_scopes(page) -> list[tuple[str, Any]]:
     locator to the modal element fixes that.
     """
     scopes: list[tuple[str, Any]] = []
-    # Strategy A: ARIA role=dialog with the SMS dialog's name.
+    # Strategy A (BEST): #uc-second-verify is抖音's stable id for the
+    # second-factor verification modal root. Confirmed via DOM inspection
+    # to wrap both the input and submit buttons. Uses a CSS id selector
+    # which is the cheapest possible lookup and least ambiguous.
+    try:
+        d = page.locator("#uc-second-verify").first
+        if await d.count() > 0 and await d.is_visible():
+            scopes.append(("#uc-second-verify", d))
+    except Exception:
+        pass
+    # Strategy B: ARIA role=dialog with the SMS dialog's name.
     try:
         d = page.get_by_role("dialog", name="接收短信验证码").first
         if await d.count() > 0 and await d.is_visible():
             scopes.append(("role=dialog[接收短信验证码]", d))
     except Exception:
         pass
-    # Strategy B: any visible role=dialog (covers cases where the dialog
+    # Strategy C: any visible role=dialog (covers cases where the dialog
     # has no accessible name but is still aria-marked).
     try:
         d = page.get_by_role("dialog").first
         if await d.count() > 0 and await d.is_visible():
-            # Don't append if it's the same node as Strategy A.
-            if not scopes or scopes[0][1] is not d:
-                scopes.append(("role=dialog", d))
+            scopes.append(("role=dialog", d))
     except Exception:
         pass
-    # Strategy C: anchor to the「短信已发送至」header text and walk up to
+    # Strategy D: anchor to the「短信已发送至」header text and walk up to
     # the nearest <article> ancestor. The header text only appears
     # inside the SMS dialog, so this gives us the right scope even
     # when ARIA roles are missing.
@@ -703,18 +762,35 @@ async def perform_sms_action(page, action: ChallengeAction) -> dict[str, Any]:
         # validity state, which their code re-evaluates on the next tick.
         # Without this pause we sometimes click while the button is still
         # disabled.
+        import asyncio
         try:
-            import asyncio
             await asyncio.sleep(0.5)
         except Exception:
             pass
         clicked = await _click_sms_submit(page)
         if not clicked:
             await _dump_page_for_debug(page, "sms_submit_failed")
-        return {
-            "ok": clicked,
-            "detail": "验证码已提交" if clicked else "验证码已填入但未点到验证按钮（可能仍是禁用状态）",
-        }
+            return {
+                "ok": False,
+                "detail": "验证码已填入但未点到验证按钮（可能仍是禁用状态）",
+            }
+
+        # Post-click verification: wait briefly, then check whether 抖音
+        # surfaced a wrong-code error message inside the dialog. If so,
+        # surface that to the user instead of misleadingly reporting
+        # success — they need to re-enter a fresh code.
+        try:
+            await asyncio.sleep(1.2)
+        except Exception:
+            pass
+        err_text = await _detect_sms_error(page)
+        if err_text:
+            logger.warning("SMS submit: dialog reported error: %s", err_text)
+            return {
+                "ok": False,
+                "detail": f"平台拒绝了验证码：{err_text}",
+            }
+        return {"ok": True, "detail": "验证码已提交"}
     if command == "abort":
         return {"ok": True, "detail": "用户取消验证"}
     if command == "noop":
@@ -835,7 +911,11 @@ async def maybe_emit_challenge(page, challenge_callback: ChallengeCallback | Non
             result["detail"],
         )
         # Loop: re-detect. If submit_code succeeded, the page navigates
-        # away and detect returns None on the next pass.
+        # away and detect returns None on the next pass. If it failed
+        # (wrong code, button still disabled, error tip surfaced), the
+        # dialog is still up — _challenge_callback's re-entry branch
+        # observes the situation (status=completed but DOM unchanged)
+        # and decides whether to noop or reset for retry.
 
 
 # ---------- exceptions ----------

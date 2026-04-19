@@ -110,17 +110,64 @@ def make_challenge_callback(
                 )
                 # Recurse-style: re-call ourselves to create a fresh one.
                 return await callback(payload)
-            if current.status in ("completed", "aborted"):
-                # Last action already consumed; the DOM is the thing that
-                # didn't catch up. Return a noop so the outer loop bails out
-                # of maybe_emit_challenge cleanly without spawning a new
-                # dify modal prompt.
+            if current.status == "aborted":
+                # Already terminal — bail out cleanly.
                 logger.info(
-                    "challenge_callback re-entered after %s session=%s; returning noop",
-                    current.status,
+                    "challenge_callback re-entered after aborted session=%s; returning noop",
                     state["session_id"],
                 )
                 return {"command": "noop"}
+            if current.status == "completed":
+                # We marked the session completed when we forwarded the
+                # user's submit_code action to the uploader. But the
+                # uploader is calling us AGAIN — meaning the SMS dialog
+                # is STILL up. Two scenarios:
+                #
+                #   1. DOM hasn't caught up yet (1-2s after a successful
+                #      submit, before the SPA navigates away). Returning
+                #      noop here lets the outer loop sleep + retry detect.
+                #   2. 抖音 rejected the code (wrong digits, expired, etc.)
+                #      and rendered an error tip in the dialog. Sleeping
+                #      won't help — the dialog will still be up after the
+                #      sleep. We should reset the session to
+                #      ``awaiting_user`` so dify keeps the modal open and
+                #      the user can submit a fresh code.
+                #
+                # We can't easily distinguish those two from inside this
+                # callback (we don't have ``page`` here). Pragmatic
+                # heuristic: noop the FIRST re-entry (covers scenario 1's
+                # transient DOM lag); on the SECOND re-entry within ~5s,
+                # reset for retry (scenario 2 — the page genuinely
+                # didn't navigate away).
+                state["completed_reentries"] = state.get("completed_reentries", 0) + 1
+                if state["completed_reentries"] < 2:
+                    logger.info(
+                        "challenge_callback re-entered after completed session=%s "
+                        "(attempt %d); returning noop to wait for SPA",
+                        state["session_id"],
+                        state["completed_reentries"],
+                    )
+                    return {"command": "noop"}
+                # Second re-entry — the dialog didn't navigate away.
+                # Treat as a wrong-code rejection and reset for retry.
+                logger.warning(
+                    "challenge_callback re-entered %d times after completed "
+                    "session=%s — assuming submit was rejected, resetting "
+                    "for user retry",
+                    state["completed_reentries"],
+                    state["session_id"],
+                )
+                challenge_sessions.update(
+                    state["session_id"],
+                    status="awaiting_user",
+                    pending_action=None,
+                    last_result={
+                        "detail": "平台拒绝了上一次验证码，请重新输入正确的 6 位短信验证码",
+                    },
+                )
+                state["completed_reentries"] = 0
+                # Fall through to the poll loop below to await the new
+                # user input.
             # Otherwise the session is still awaiting/submitted — fall
             # through to the poll loop below; no reset needed.
 
