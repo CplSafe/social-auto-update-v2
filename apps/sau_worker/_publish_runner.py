@@ -77,27 +77,47 @@ def safe_unlink(path: str | None) -> None:
 
 
 def download_video_url(url: str, *, dest: Path) -> Path:
-    """Stream a presigned URL to disk with a hard size cap."""
+    """Stream a presigned URL to disk with a hard size cap.
+
+    Retries on transient connection / SSL errors before giving up so a
+    one-off TLS reset (common with self-signed or load-balanced backends)
+    doesn't blow up an entire publish.
+    """
     timeout = httpx.Timeout(
         float(os.getenv("SAU_DOWNLOAD_TIMEOUT_SECONDS", "600"))
     )
     max_bytes = int(
         os.getenv("SAU_DOWNLOAD_MAX_BYTES", str(1024 * 1024 * 1024))  # 1GB
     )
-    written = 0
-    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-        with client.stream("GET", url) as response:
-            response.raise_for_status()
-            with dest.open("wb") as fh:
-                for chunk in response.iter_bytes(chunk_size=64 * 1024):
-                    written += len(chunk)
-                    if written > max_bytes:
-                        raise RuntimeError(
-                            f"video exceeds SAU_DOWNLOAD_MAX_BYTES ({max_bytes})"
-                        )
-                    fh.write(chunk)
-    dest.chmod(0o600)
-    return dest
+    verify_ssl = os.getenv("SAU_DOWNLOAD_VERIFY_SSL", "1").lower() not in ("0", "false", "no")
+    max_retries = int(os.getenv("SAU_DOWNLOAD_RETRIES", "3"))
+    last_exc: Exception | None = None
+
+    for attempt in range(1, max_retries + 1):
+        written = 0
+        try:
+            with httpx.Client(timeout=timeout, follow_redirects=True, verify=verify_ssl) as client:
+                with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    with dest.open("wb") as fh:
+                        for chunk in response.iter_bytes(chunk_size=64 * 1024):
+                            written += len(chunk)
+                            if written > max_bytes:
+                                raise RuntimeError(
+                                    f"video exceeds SAU_DOWNLOAD_MAX_BYTES ({max_bytes})"
+                                )
+                            fh.write(chunk)
+            dest.chmod(0o600)
+            return dest
+        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as exc:
+            last_exc = exc
+            logger.warning(
+                "download attempt %d/%d failed: %s", attempt, max_retries, exc
+            )
+            if attempt < max_retries:
+                import time
+                time.sleep(2 ** attempt)
+    raise last_exc if last_exc else RuntimeError("download failed without exception")
 
 
 # ---------- platform binding ----------
