@@ -119,13 +119,30 @@ async def detect_sms_challenge(page) -> ChallengeKind | None:
 async def _detect_sms_step(page) -> Literal["chooser", "input"] | None:
     """Classify which step of the SMS challenge the page is on, or None.
 
-    The order matters: input-page detection runs first because the
-    chooser's '短信验证码' phrase is technically a substring of the input
-    page's '接收短信验证码' header — without ordering we'd false-positive
-    a chooser hit on an input page.
+    Detection priority (most reliable first):
+      1. ``#uc-second-verify`` element exists → input page. This is抖音's
+         stable DOM id for the second-factor verification modal root —
+         present in both login and publish flows, in every text-locale
+         variant. Discovered via DOM inspection / accessibility snapshot.
+      2. Input-page text markers (variants like 「短信已发送至」/
+         「请输入当前手机号」). Subject to React-induced text-node split,
+         so id-first is preferred.
+      3. Chooser-page markers (login flow only).
     """
     try:
-        # STEP B (input page) — strong single marker.
+        # Strategy 1: stable id check — covers both login & publish flows.
+        try:
+            modal = page.locator("#uc-second-verify").first
+            if await modal.count() > 0 and await modal.is_visible():
+                logger.info(
+                    "SMS challenge detected: step=input (via #uc-second-verify)",
+                )
+                return "input"
+        except Exception:
+            logger.debug("#uc-second-verify probe failed", exc_info=True)
+
+        # Strategy 2: text-marker fallback for any future modal variant
+        # that doesn't carry the id (or uses a different one).
         for marker in _SMS_INPUT_PAGE_MARKERS:
             if await page.get_by_text(marker).count() > 0:
                 logger.info(
@@ -133,8 +150,8 @@ async def _detect_sms_step(page) -> Literal["chooser", "input"] | None:
                     marker,
                 )
                 return "input"
-        # STEP A (chooser page) — needs both markers to avoid matching a
-        # generic page that just mentions "身份验证" in some help text.
+
+        # Strategy 3: chooser-page detection (login flow only).
         hits: list[str] = []
         for marker in _SMS_CHOOSER_MARKERS:
             if await page.get_by_text(marker).count() > 0:
@@ -823,6 +840,10 @@ async def maybe_emit_challenge(page, challenge_callback: ChallengeCallback | Non
     # spin forever burning DOM-query CPU.
     max_advances = 3
     advance_count = 0
+    # Local per-call state so subsequent loop iterations don't repeat
+    # one-shot side effects (e.g. clicking 获取验证码 on every re-entry
+    # would burn the user's SMS quota).
+    state: dict[str, Any] = {}
 
     # The loop runs until we leave the SMS challenge entirely OR the user
     # aborts. After each user-side action we re-detect because:
@@ -865,12 +886,40 @@ async def maybe_emit_challenge(page, challenge_callback: ChallengeCallback | Non
                 pass
             continue
 
-        # STEP B: input page. Surface to dify so the user can submit the
-        # OTP. Note: 抖音 already auto-dispatches the SMS the moment we
-        # land on the input page (the header reads "短信已发送至 ***"),
-        # so the user can usually skip ``trigger_sms`` and go straight to
-        # ``submit_code``. They only need ``trigger_sms`` if the first
-        # SMS didn't arrive and the 60s countdown is up.
+        # STEP B: input page.
+        #
+        # 抖音 has TWO landing variants for this page:
+        #   - Login flow: SMS auto-dispatched on entry; header reads
+        #     "短信已发送至 ***".
+        #   - Publish flow: dialog opens with NO SMS sent yet; user (or
+        #     us) has to click「获取验证码」first.
+        #
+        # We auto-click「获取验证码」on the FIRST visit so dify users
+        # never see a "click resend first" step. The button is harmless
+        # to click in the login variant — it's already in countdown
+        # state and the click is a no-op. The detection that we've
+        # entered this page only happens once per upload (state =
+        # ``sms_triggered_for_input``) so we don't accidentally re-
+        # trigger after every callback re-entry.
+        if not state.get("sms_triggered_for_input"):
+            state["sms_triggered_for_input"] = True
+            triggered = await _click_sms_trigger(page)
+            if triggered:
+                logger.info("auto-clicked「获取验证码」on input page entry")
+                # Brief pause so the SPA's "短信已发送至 ***" header
+                # update has time to render before we surface to dify.
+                try:
+                    import asyncio
+                    await asyncio.sleep(1.5)
+                except Exception:
+                    pass
+            else:
+                # Already in countdown / login-variant where SMS was
+                # already sent — fine, just continue.
+                logger.info(
+                    "no「获取验证码」trigger needed (already sent or in countdown)",
+                )
+
         payload: ChallengePayload = {"kind": "sms", "page_url": page.url}
         response_or_awaitable = challenge_callback(payload)
         action: ChallengeAction | None
