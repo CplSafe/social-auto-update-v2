@@ -595,23 +595,57 @@ async def _click_chooser_row(page) -> bool:
     """Click the「接收短信验证码」row on the chooser page.
 
     抖音's row is a deep <div> tree where the visible text and the
-    clickable container are different nodes. ``get_by_text`` finds the
-    leaf carrying the label, then we walk up via xpath ancestor lookup
-    to find a clickable container (cursor:pointer, role=button, or just
-    the immediate flex row). Falls back to clicking the text leaf
-    directly — Playwright's ``click()`` already trampolines into the
-    nearest event-handling ancestor for us when it can.
+    clickable container are different nodes. We try multiple strategies:
+    1. JS-based: walk DOM, find element with the text, dispatch click on
+       it and on each ancestor until one of them advances the page.
+    2. Playwright locator + ancestor xpath fallback.
     """
+    # Strategy 1: JS-driven click — most robust against 抖音 changing the
+    # row's clickable ancestor class names. We dispatch the click event
+    # on the text node's ancestors from innermost to outermost; the first
+    # one with an attached handler wins.
+    try:
+        clicked = await page.evaluate(
+            """
+            (label) => {
+                const all = Array.from(document.querySelectorAll('*'));
+                const candidates = all.filter(el =>
+                    el.children.length === 0 &&
+                    el.innerText &&
+                    el.innerText.trim() === label
+                );
+                if (candidates.length === 0) return false;
+                for (const leaf of candidates) {
+                    let cur = leaf;
+                    for (let depth = 0; depth < 6 && cur; depth++) {
+                        try {
+                            cur.click();
+                        } catch (e) {}
+                        cur = cur.parentElement;
+                    }
+                }
+                return true;
+            }
+            """,
+            _CHOOSER_ADVANCE_TEXT,
+        )
+        if clicked:
+            # Give the page a moment to navigate to the input step.
+            await page.wait_for_timeout(800)
+            new_step = await _detect_sms_step(page)
+            if new_step == "input":
+                logger.info("chooser advanced to input via JS click")
+                return True
+    except Exception as exc:
+        logger.debug("JS chooser click failed: %s", exc, exc_info=True)
+
+    # Strategy 2: original locator-based approach.
     text_loc = page.get_by_text(_CHOOSER_ADVANCE_TEXT, exact=True).first
     try:
         if await text_loc.count() == 0:
-            # Fallback to non-exact match — abrupt whitespace / extra
-            # decoration around the label can break exact-match.
             text_loc = page.get_by_text(_CHOOSER_ADVANCE_TEXT).first
         if await text_loc.count() == 0:
             return False
-        # Walk up to the nearest ancestor that looks clickable (covers
-        # 抖音's div-with-onClick rows). Falls back to the text leaf.
         clickable_xpath = (
             "ancestor-or-self::*[@role='button' or "
             "contains(@style, 'cursor: pointer') or "
@@ -629,7 +663,6 @@ async def _click_chooser_row(page) -> bool:
         return True
     except Exception as exc:
         logger.warning("chooser row click failed: %s", exc, exc_info=True)
-        # Last-resort: try the text leaf directly without ancestor walking.
         try:
             await text_loc.click(timeout=3000)
             return True
