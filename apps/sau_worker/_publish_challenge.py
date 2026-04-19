@@ -291,30 +291,56 @@ async def _fill_sms_code(page, code: str) -> bool:
         return False
 
     try:
+        import asyncio
         await target.scroll_into_view_if_needed(timeout=2000)
-        # Focus + clear + type. Sequence:
-        #   1. click → puts the cursor in the input + focuses it
-        #   2. select-all + delete → wipes any partial value (e.g. from
-        #      a prior failed attempt that left "123" stuck)
-        #   3. keyboard.type per-character with 80ms delay → dispatches
-        #      real keydown/keypress/input events that React listens for
-        await target.click(timeout=2000)
-        # Use keyboard shortcut to select all existing content, then
-        # backspace it. Works regardless of OS (Cmd vs Ctrl) because we
-        # send both modifiers and the SPA accepts whichever is "real".
+
+        # Read pre-state so we can see if the field already has stale data
+        # (debugging notes mentioned the field stuck at "123" between attempts).
         try:
-            await page.keyboard.press("ControlOrMeta+a")
-            await page.keyboard.press("Backspace")
+            pre_value = (await target.input_value(timeout=1000)).strip()
         except Exception:
-            # Fallback: triple-click selects the whole field on most browsers.
+            pre_value = "<unreadable>"
+        logger.info(
+            "SMS fill pre-state: selector=%s pre_value=%r target_code=%r",
+            matched_selector, pre_value, code,
+        )
+
+        # Step 1: focus.
+        await target.click(timeout=2000)
+
+        # Step 2: clear. fill("") is the single most reliable reset for a
+        # controlled React input — one synthetic change event with empty
+        # value. Falls back to keyboard select-all+backspace.
+        try:
+            await target.fill("", timeout=2000)
+        except Exception:
+            logger.debug("fill('') failed, trying select-all+backspace")
             try:
-                await target.click(click_count=3, timeout=1000)
+                await page.keyboard.press("ControlOrMeta+a")
                 await page.keyboard.press("Backspace")
             except Exception:
                 pass
-        # Type the code character by character with a small delay so
-        # each digit fires its own input event.
-        await page.keyboard.type(code, delay=80)
+
+        # Re-focus in case fill('') blurred us.
+        await target.click(timeout=1000)
+
+        # Step 3: type each digit individually, logging the input value
+        # after every keystroke so we can see exactly which keystroke
+        # gets dropped if any.
+        for i, ch in enumerate(code):
+            await page.keyboard.press(ch, delay=120)
+            try:
+                cur = (await target.input_value(timeout=500)).strip()
+            except Exception:
+                cur = "<unreadable>"
+            logger.info(
+                "SMS fill keystroke %d/%d: pressed=%r value_now=%r",
+                i + 1, len(code), ch, cur,
+            )
+
+        # Settle delay — let any debounced React state update flush.
+        await asyncio.sleep(0.3)
+
         # Verify the value actually landed.
         actual = (await target.input_value(timeout=2000)).strip()
         if actual == code:
