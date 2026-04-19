@@ -604,22 +604,37 @@ async def _click_chooser_row(page) -> bool:
        it and on each ancestor until one of them advances the page.
     2. Playwright locator + ancestor xpath fallback.
     """
-    # Strategy 0: direct xpath — 抖音's chooser modal has a stable
-    # structure under #uc-second-verify. The first list row is the SMS
-    # option. Try this before the generic JS approach.
-    direct_xpath = '//*[@id="uc-second-verify"]/div/div/article/div[2]/div[3]/div[1]'
-    for frame in page.frames:
-        try:
-            loc = frame.locator(f"xpath={direct_xpath}").first
-            if await loc.count() > 0:
-                await loc.click(timeout=3000)
-                logger.info("chooser clicked via direct xpath in frame: %s", frame.url or "<main>")
-                await page.wait_for_timeout(800)
-                new_step = await _detect_sms_step(page)
-                if new_step == "input":
-                    return True
-        except Exception as exc:
-            logger.debug("direct xpath click failed in frame %s: %s", frame.url, exc)
+    # Strategy 0: target the chooser row by 抖音's stable class prefix
+    # `uc_verification_component_list_item`. Confirmed via devtools
+    # inspection — this is the clickable row container. The hash suffix
+    # (-ZI1VMT etc.) changes per build so we use prefix matching.
+    chooser_js = """
+        (label) => {
+            // Find row containers by class prefix
+            const rows = [...document.querySelectorAll('div[class*="uc_verification_component_list_item"]')];
+            // Prefer the one whose innerText contains the SMS label
+            const target = rows.find(r => r.innerText && r.innerText.includes(label)) || rows[0];
+            if (!target) return false;
+            target.click();
+            return true;
+        }
+    """
+    try:
+        clicked_any = False
+        for frame in page.frames:
+            try:
+                if await frame.evaluate(chooser_js, _CHOOSER_ADVANCE_TEXT):
+                    clicked_any = True
+                    logger.info("chooser clicked via class-prefix in frame: %s", frame.url or "<main>")
+            except Exception as exc:
+                logger.debug("class-prefix click failed in frame %s: %s", frame.url, exc)
+        if clicked_any:
+            await page.wait_for_timeout(1000)
+            new_step = await _detect_sms_step(page)
+            if new_step == "input":
+                return True
+    except Exception as exc:
+        logger.debug("class-prefix strategy failed: %s", exc, exc_info=True)
 
     # Strategy 1: JS-driven click across all frames (main + iframes).
     # 抖音's SMS chooser is rendered inside a same-origin iframe (e.g.
