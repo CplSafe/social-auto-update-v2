@@ -140,21 +140,20 @@ async def _detect_sms_step(page) -> Literal["chooser", "input"] | None:
                         '#uc-second-verify, article, [role="dialog"], div'
                     )].some(el => el.innerText && el.innerText.includes('接收短信验证码'));
                     if (!hasTitle) return 'none';
-                    // Input page has a 6-digit code input (button-input id or
-                    // placeholder '请输入验证码'). Chooser page does not.
+                    // Input page has a code input field. Chooser page doesn't.
                     const hasInput = !!(
                         document.querySelector('#button-input') ||
-                        document.querySelector('input[placeholder*="验证码"]')
+                        document.querySelector('input[placeholder*="验证码"]') ||
+                        document.querySelector('input[name="button-input"]')
                     );
-                    // Chooser page has both "接收短信验证码" AND "发送短信验证"
-                    // rows side by side.
-                    const hasChooserAlt = [...document.querySelectorAll('div')].some(
-                        el => el.children.length === 0 &&
-                              el.innerText && el.innerText.trim() === '发送短信验证'
-                    );
-                    if (hasChooserAlt && !hasInput) return 'chooser';
                     if (hasInput) return 'input';
-                    return 'input';
+                    // No input field but title present → chooser page.
+                    // (chooser has list rows like uc_verification_component_list_item)
+                    const chooserRows = document.querySelectorAll(
+                        '[class*="uc_verification_component_list_item"]'
+                    );
+                    if (chooserRows.length > 0) return 'chooser';
+                    return 'chooser';
                 }"""
             )
             if probe == "input":
