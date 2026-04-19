@@ -130,35 +130,39 @@ async def _detect_sms_step(page) -> Literal["chooser", "input"] | None:
       3. Chooser-page markers (login flow only).
     """
     try:
-        # Strategy 1 (PRIMARY): JS-based detection mirroring the
-        # devtools-verified pattern. We look for *any* element among the
-        # likely modal containers whose innerText includes 「接收短信验证码」.
-        # This is the most reliable signal because:
-        #   - The title text is identical across both login and publish flows.
-        #   - Walking with `[...querySelectorAll('#uc-second-verify, article,
-        #     [role="dialog"], div')].find(el => innerText.includes(...))`
-        #     is robust against React-induced text-node splits that defeat
-        #     Playwright's get_by_text() locator.
-        #   - is_visible() on the modal root sometimes returns false during
-        #     mount transitions; checking innerText sidesteps that.
+        # Strategy 1 (PRIMARY): JS probe — distinguish chooser vs input by
+        # checking for an actual code-input field. Chooser page also
+        # contains '接收短信验证码' (as the row label) but has no input.
         try:
-            has_modal_title = await page.evaluate(
+            probe = await page.evaluate(
                 """() => {
-                    const candidates = [
-                        ...document.querySelectorAll(
-                            '#uc-second-verify, article, [role="dialog"], div'
-                        ),
-                    ];
-                    return candidates.some(
-                        el => el.innerText && el.innerText.includes('接收短信验证码')
+                    const hasTitle = [...document.querySelectorAll(
+                        '#uc-second-verify, article, [role="dialog"], div'
+                    )].some(el => el.innerText && el.innerText.includes('接收短信验证码'));
+                    if (!hasTitle) return 'none';
+                    // Input page has a 6-digit code input (button-input id or
+                    // placeholder '请输入验证码'). Chooser page does not.
+                    const hasInput = !!(
+                        document.querySelector('#button-input') ||
+                        document.querySelector('input[placeholder*="验证码"]')
                     );
+                    // Chooser page has both "接收短信验证码" AND "发送短信验证"
+                    // rows side by side.
+                    const hasChooserAlt = [...document.querySelectorAll('div')].some(
+                        el => el.children.length === 0 &&
+                              el.innerText && el.innerText.trim() === '发送短信验证'
+                    );
+                    if (hasChooserAlt && !hasInput) return 'chooser';
+                    if (hasInput) return 'input';
+                    return 'input';
                 }"""
             )
-            if has_modal_title:
-                logger.info(
-                    "SMS challenge detected: step=input (via JS title probe '接收短信验证码')",
-                )
+            if probe == "input":
+                logger.info("SMS challenge detected: step=input (via JS probe)")
                 return "input"
+            if probe == "chooser":
+                logger.info("SMS challenge detected: step=chooser (via JS probe)")
+                return "chooser"
         except Exception:
             logger.debug("JS title probe failed", exc_info=True)
 
