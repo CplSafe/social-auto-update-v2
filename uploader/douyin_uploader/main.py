@@ -148,12 +148,24 @@ async def _is_douyin_login_completed(page: Page) -> bool:
     return True
 
 
-async def _wait_for_douyin_login(page: Page, account_file: str, qrcode_info: dict, qrcode_callback=None, poll_interval: int = 3, max_checks: int = 100) -> dict:
+async def _wait_for_douyin_login(page: Page, account_file: str, qrcode_info: dict, qrcode_callback=None, poll_interval: int = 3, max_checks: int = 100, challenge_callback=None) -> dict:
+    """P7 patch (vs upstream): ``challenge_callback`` lets the wait loop
+    detect post-scan SMS challenges and hand them off for user resolution."""
     qrcode_path = Path(qrcode_info["image_path"])
     for _ in range(max_checks):
         if await _is_douyin_login_completed(page):
             douyin_logger.info(_msg("🥳", f"扫码成功，已经跳转到登录后页面: {page.url}"))
             return _build_login_result(True, "success", "抖音扫码登录成功", account_file, qrcode_info, page.url)
+
+        # P7 patch: 抖音扫码后可能跳到短信验证页面（不是登录完成、也不是
+        # 二维码失效）。让用户在 dify 模态框完成短信验证后继续走完登录。
+        if challenge_callback is not None:
+            from apps.sau_worker._publish_challenge import maybe_emit_challenge
+            try:
+                await maybe_emit_challenge(page, challenge_callback)
+            except Exception as exc:
+                douyin_logger.warning(_msg("😵", f"短信验证流程被中断: {exc}"))
+                return _build_login_result(False, "failed", str(exc), account_file, qrcode_info, page.url)
 
         expired_box = page.get_by_text("二维码失效", exact=True).locator("..").first
         if await expired_box.count() and await expired_box.is_visible():
@@ -174,7 +186,11 @@ async def douyin_cookie_gen(
     poll_interval: int = 3,
     max_checks: int = 100,
     headless: bool = LOCAL_CHROME_HEADLESS,
+    challenge_callback=None,
 ):
+    """P7 patch (vs upstream): ``challenge_callback`` is invoked when the
+    post-scan flow surfaces an SMS verification challenge. See
+    apps/sau_worker/_publish_challenge for the contract."""
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=headless, channel="chrome")
         context = await browser.new_context()
@@ -194,6 +210,7 @@ async def douyin_cookie_gen(
                 qrcode_callback=qrcode_callback,
                 poll_interval=poll_interval,
                 max_checks=max_checks,
+                challenge_callback=challenge_callback,
             )
             if result["success"]:
                 await asyncio.sleep(2)
@@ -385,6 +402,7 @@ class DouYinVideo(DouYinBaseUploader):
         publish_strategy: str = DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        challenge_callback=None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -401,10 +419,26 @@ class DouYinVideo(DouYinBaseUploader):
         self.productLink = productLink
         self.productTitle = productTitle
         self.desc = desc or ""
+        # P7 patch (vs upstream): mirror the qrcode_callback shape — caller
+        # supplies a callable that the upload flow invokes when it detects
+        # an SMS challenge mid-upload. See apps/sau_worker/_publish_challenge.
+        self.challenge_callback = challenge_callback
         # P5: location flows from platform_payload through the runner.
         # The base class's set_location() is now called from upload()
         # below; an empty string is a no-op so passing "" is safe.
         self.location = location or ""
+
+    async def _maybe_check_challenge(self, page) -> None:
+        """P7 patch (vs upstream): probe the page for an SMS challenge and
+        hand off to ``self.challenge_callback`` if one surfaces. No-op when
+        no callback is wired (CLI usage / tests). The actual detection,
+        page-action selectors and abort handling all live in
+        ``apps/sau_worker/_publish_challenge`` so future upstream sync only
+        has to merge the call sites, not the SMS logic."""
+        if self.challenge_callback is None:
+            return
+        from apps.sau_worker._publish_challenge import maybe_emit_challenge
+        await maybe_emit_challenge(page, self.challenge_callback)
 
     async def validate_upload_args(self):
         await self.validate_base_args()
@@ -488,6 +522,7 @@ class DouYinVideo(DouYinBaseUploader):
         douyin_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
         douyin_logger.info(_msg("🧭", "小人正在赶往上传主页"))
         await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload")
+        await self._maybe_check_challenge(page)  # P7 patch — see __init__
         await page.locator("div[class^='container'] input").set_input_files(self.file_path)
 
         while True:
@@ -514,6 +549,7 @@ class DouYinVideo(DouYinBaseUploader):
         douyin_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
         await self.fill_title_and_description(page, self.title, self.desc or self.title, self.tags)
         douyin_logger.info(_msg("🏷️", f"小人一共贴了 {len(self.tags)} 个话题"))
+        await self._maybe_check_challenge(page)  # P7 patch — see __init__
 
         while True:
             try:
@@ -551,6 +587,8 @@ class DouYinVideo(DouYinBaseUploader):
 
         if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_douyin(page, self.publish_date)
+
+        await self._maybe_check_challenge(page)  # P7 patch — last chance before clicking 发布
 
         while True:
             try:

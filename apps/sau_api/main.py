@@ -7,7 +7,7 @@ from fastapi import Depends, FastAPI
 
 from apps.sau_api.deps import verify_sau_token
 from apps.sau_api.login_sessions import registry
-from apps.sau_api.routers import accounts, health, login_sse, publish, tasks
+from apps.sau_api.routers import accounts, challenge, health, login_sse, publish, tasks
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,7 @@ _protected = (
     (login_sse.router, "login"),
     (publish.router, "publish"),
     (tasks.router, "tasks"),
+    (challenge.router, "challenge"),
 )
 for router, tag in _protected:
     app.include_router(

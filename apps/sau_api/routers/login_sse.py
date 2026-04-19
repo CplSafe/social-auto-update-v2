@@ -135,6 +135,32 @@ async def start_login(req: LoginRequest) -> dict[str, Any]:
         module = importlib.import_module(module_path)
         cookie_gen_fn = getattr(module, fn_name)
 
+        # P7: build the SMS challenge callback for the login flow. When 抖音
+        # / 小红书 pop a SMS verification page after the QR scan, the upstream
+        # ``_wait_for_*_login`` loop calls this; we register a challenge_session
+        # in Redis and surface its id on the LoginSession so dify can render
+        # a「输入短信验证码」modal.
+        from apps.sau_worker._challenge_callback import make_challenge_callback
+
+        def _on_challenge_session(session) -> None:
+            # Push the challenge_session_id onto the LoginSession registry
+            # asynchronously — this hook is called from a sync context inside
+            # the async callback, so we schedule via call_soon_threadsafe.
+            asyncio.create_task(
+                registry.update(
+                    req.session_id,
+                    challenge_session_id=session.session_id,
+                    status="awaiting_user",
+                )
+            )
+
+        challenge_callback = make_challenge_callback(
+            tenant_id=req.tenant_id,
+            sau_account_id=sau_account_id,
+            platform=req.platform,
+            on_session_created=_on_challenge_session,
+        )
+
         poll_interval = int(os.getenv("SAU_LOGIN_POLL_INTERVAL_SEC", "3"))
         max_checks = int(os.getenv("SAU_LOGIN_MAX_CHECKS", "60"))
         headless = os.getenv("SAU_LOGIN_HEADLESS", "1").lower() in ("1", "true", "yes")
@@ -145,6 +171,7 @@ async def start_login(req: LoginRequest) -> dict[str, Any]:
                 poll_interval=poll_interval,
                 max_checks=max_checks,
                 headless=headless,
+                challenge_callback=challenge_callback,
             )
         except asyncio.CancelledError:
             # Cancellation is the expected shutdown / expiry / timeout path —

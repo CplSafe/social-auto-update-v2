@@ -212,7 +212,10 @@ async def xiaohongshu_cookie_gen(
     poll_interval: int = 3,
     max_checks: int = 100,
     headless: bool = LOCAL_CHROME_HEADLESS,
+    challenge_callback=None,
 ):
+    """P7 patch (vs upstream): ``challenge_callback`` is invoked when the
+    post-scan flow surfaces an SMS verification challenge."""
     if headless:
         xiaohongshu_logger.info(_msg("🖼️", "小红书登录将以无头模式运行，小人会输出终端二维码并保存本地二维码图片"))
 
@@ -250,6 +253,17 @@ async def xiaohongshu_cookie_gen(
                             page.url,
                         )
                     return result
+
+                # P7 patch: 小红书扫码后可能跳到短信验证页。让用户在 dify
+                # 模态框完成短信验证后继续走完登录。
+                if challenge_callback is not None:
+                    from apps.sau_worker._publish_challenge import maybe_emit_challenge
+                    try:
+                        await maybe_emit_challenge(page, challenge_callback)
+                    except Exception as exc:
+                        xiaohongshu_logger.warning(_msg("😵", f"短信验证流程被中断: {exc}"))
+                        result = _build_login_result(False, "failed", str(exc), account_file, qrcode_info, page.url)
+                        return result
 
                 await asyncio.sleep(poll_interval)
 
@@ -428,6 +442,7 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         publish_strategy: str = XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        challenge_callback=None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -445,6 +460,17 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         # Upstream had `set_location` defined but commented out in
         # upload_video_content — P5 wires it in for real.
         self.location = location or ""
+        # P7 patch (vs upstream): SMS challenge callback. See DouYinVideo
+        # for the full pattern; the helper is shared in
+        # apps/sau_worker/_publish_challenge.
+        self.challenge_callback = challenge_callback
+
+    async def _maybe_check_challenge(self, page) -> None:
+        """P7 patch (vs upstream): mirror DouYinVideo._maybe_check_challenge."""
+        if self.challenge_callback is None:
+            return
+        from apps.sau_worker._publish_challenge import maybe_emit_challenge
+        await maybe_emit_challenge(page, self.challenge_callback)
 
     async def validate_upload_args(self):
         await self.validate_base_args()
@@ -493,6 +519,7 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         xiaohongshu_logger.info(_msg("🧭", "小人正在赶往视频发布页"))
         await page.goto(XHS_PUBLISH_VIDEO_URL)
         await page.wait_for_url(XHS_PUBLISH_VIDEO_URL)
+        await self._maybe_check_challenge(page)  # P7 patch — see __init__
         await page.locator("div[class^='upload-content'] input[class='upload-input']").set_input_files(self.file_path)
 
         while True:
@@ -519,7 +546,9 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                         break
                     
                     if self.debug:
-                        xiaohongshu_logger.debug(_msg("🧍", f"预览区域内容: {all_text.strip().replace('\\n', ' ')}"))
+                        # Pre-extract to avoid f-string backslash limitation on Python 3.11.
+                        _preview_text = all_text.strip().replace('\n', ' ')
+                        xiaohongshu_logger.debug(_msg("🧍", f"预览区域内容: {_preview_text}"))
                     xiaohongshu_logger.debug(_msg("🧍", "还没看到上传成功标识，小人继续等一会"))
                 else:
                     # 尝试检查标题输入框是否已经出现，如果是，说明已经进入编辑状态
@@ -534,6 +563,7 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
 
         xiaohongshu_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
         await self.fill_meta(page)
+        await self._maybe_check_challenge(page)  # P7 patch — see __init__
 
         await self.set_thumbnail(page, self.thumbnail_path)
 
@@ -547,6 +577,8 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
 
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
+
+        await self._maybe_check_challenge(page)  # P7 patch — last chance before clicking 发布
 
         while True:
             try:

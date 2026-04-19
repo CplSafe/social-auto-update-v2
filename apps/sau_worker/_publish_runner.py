@@ -129,6 +129,9 @@ async def _run_publish_async(
     desc: str | None,
     publish_date: datetime | int,
     extra_kwargs: dict[str, Any],
+    tenant_id: str,
+    sau_account_id: str,
+    on_challenge_session=None,
 ) -> dict[str, Any]:
     cookie_auth, video_cls = binding.import_uploader()
 
@@ -139,6 +142,20 @@ async def _run_publish_async(
             "message": "cookie_auth returned false",
         }
 
+    # P7: build the SMS challenge callback so upstream upload() can hand
+    # off mid-flow when抖音/小红书 pops a verification page. The callback
+    # creates a Redis-backed challenge_session, polls for the user's
+    # action through dify, and feeds it back to the uploader.
+    from apps.sau_worker._challenge_callback import make_challenge_callback
+    from apps.sau_worker._publish_challenge import VerificationAbortedError
+
+    challenge_callback = make_challenge_callback(
+        tenant_id=tenant_id,
+        sau_account_id=sau_account_id,
+        platform=binding.name,
+        on_session_created=on_challenge_session,
+    )
+
     uploader = video_cls(
         title=title,
         file_path=video_path,
@@ -146,11 +163,21 @@ async def _run_publish_async(
         publish_date=publish_date,
         account_file=str(cookie_path),
         desc=desc,
+        challenge_callback=challenge_callback,
         **extra_kwargs,
     )
     try:
         await uploader.main()
         return {"success": True, "current_url": "", "status": "success"}
+    except VerificationAbortedError as exc:
+        # User declined to complete the SMS verification — surface a
+        # typed status so dify's _poll_sau classifies it specifically
+        # rather than the generic upload_failed bucket.
+        return {
+            "success": False,
+            "status": "verification_aborted",
+            "message": f"用户取消了短信验证: {exc.reason}",
+        }
     except Exception as exc:  # noqa: BLE001 — surface as upstream-classified failure
         return {
             "success": False,
@@ -313,6 +340,26 @@ def _run_with_video(
     if binding.apply_platform_extras is not None:
         desc, extra_kwargs = binding.apply_platform_extras(desc, platform_payload)
 
+    # P7: surface the challenge_session_id back into the celery task's
+    # bound state so dify's _poll_sau picks it up and renders a "需要短信
+    # 验证" badge. We use ``self.update_state(meta={...})`` because that's
+    # the only meta channel available before the task returns.
+    def _on_challenge_session(session) -> None:
+        try:
+            self.update_state(
+                state="STARTED",
+                meta={
+                    "challenge_session_id": session.session_id,
+                    "challenge_kind": session.kind,
+                    "challenge_platform": session.platform,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "failed to publish challenge_session_id to celery meta",
+                extra={"task_id": self.request.id},
+            )
+
     try:
         result = asyncio.run(
             _run_publish_async(
@@ -324,6 +371,9 @@ def _run_with_video(
                 desc=desc,
                 publish_date=publish_date,
                 extra_kwargs=extra_kwargs,
+                tenant_id=tenant_id,
+                sau_account_id=sau_account_id,
+                on_challenge_session=_on_challenge_session,
             )
         )
     except Exception as exc:

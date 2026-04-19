@@ -21,8 +21,18 @@ from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
-SessionStatus = Literal["waiting", "scanned", "success", "failed", "expired"]
-SESSION_TTL_SECONDS = 200
+SessionStatus = Literal[
+    "waiting",
+    "scanned",
+    "awaiting_user",  # P7: SMS challenge surfaced; user needs to act
+    "success",
+    "failed",
+    "expired",
+]
+# P7: bumped from 200 to 600 because the awaiting_user state now lives
+# inside this same TTL window — the user can take a few minutes to read
+# their SMS and type the code.
+SESSION_TTL_SECONDS = 600
 
 
 @dataclass
@@ -37,6 +47,10 @@ class LoginSession:
     profile: dict[str, Any] | None = None
     message: str | None = None
     task: asyncio.Task[Any] | None = None
+    # P7: when status == "awaiting_user", this holds the id of the
+    # ``ChallengeSession`` (in apps/sau_api/challenge_sessions.py) that
+    # dify can hit to drive the SMS-relay flow.
+    challenge_session_id: str | None = None
 
     def is_terminal(self) -> bool:
         return self.status in ("success", "failed", "expired")
@@ -50,6 +64,7 @@ class LoginSession:
             "sau_account_id": self.sau_account_id if self.status != "waiting" else None,
             "profile": self.profile,
             "message": self.message,
+            "challenge_session_id": self.challenge_session_id,
         }
 
 
