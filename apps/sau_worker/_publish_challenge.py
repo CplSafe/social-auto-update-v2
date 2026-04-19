@@ -195,6 +195,45 @@ _SUBMIT_BUTTON_SELECTORS = (
 )
 
 
+async def _dump_page_for_debug(page, label: str) -> None:
+    """Save the current page HTML + screenshot under SAU_TMP_DIR for
+    operator inspection when our SMS automation can't find what it
+    expected. Helps diagnose抖音 DOM changes without making the user
+    re-trigger the flow each time we need a closer look.
+
+    Best-effort: never raise — failure here is purely diagnostic noise.
+    """
+    import os as _os
+    import time as _time
+    try:
+        tmp_root = _os.getenv(
+            "SAU_TMP_DIR", "/Users/guijinhao/Documents/social-auto-upload/.sau_data/tmp",
+        )
+        debug_dir = _os.path.join(tmp_root, "challenge_debug")
+        _os.makedirs(debug_dir, exist_ok=True)
+        ts = _time.strftime("%Y%m%d_%H%M%S")
+        html_path = _os.path.join(debug_dir, f"{label}_{ts}.html")
+        png_path = _os.path.join(debug_dir, f"{label}_{ts}.png")
+        try:
+            html = await page.content()
+            with open(html_path, "w", encoding="utf-8") as fh:
+                fh.write(html)
+        except Exception:
+            logger.debug("page.content() failed", exc_info=True)
+        try:
+            await page.screenshot(path=png_path, full_page=True, timeout=5000)
+        except Exception:
+            logger.debug("page.screenshot() failed", exc_info=True)
+        logger.warning(
+            "SMS automation snapshot saved: html=%s png=%s — please send these "
+            "to the dify team if the SMS flow keeps failing",
+            html_path,
+            png_path,
+        )
+    except Exception:
+        logger.debug("debug dump failed", exc_info=True)
+
+
 async def _click_first_match(page, selectors: tuple[str, ...]) -> bool:
     """Click the first selector that finds at least one element. Return
     True on click, False if nothing matched (caller decides what to do)."""
@@ -212,78 +251,125 @@ async def _click_first_match(page, selectors: tuple[str, ...]) -> bool:
 async def _fill_sms_code(page, code: str) -> bool:
     """Fill the SMS verification code into 抖音's input field.
 
-    抖音 uses ``placeholder="请输入验证码"`` for the visible input.
-    ``page.get_by_placeholder`` is the most resilient way to find it —
-    survives DOM nesting changes that defeat CSS selectors. Falls back
-    to a label-anchored search and finally to type-based matching.
+    抖音 wraps inputs in a Semi Design ``.semi-input-wrapper`` shell, so
+    the visible input is buried under several layers of div. We try
+    multiple strategies because the placeholder text isn't stable across
+    抖音 product surfaces.
 
     Returns True only when fill targets the actual visible challenge
-    input — guards against accidentally writing to a hidden phone-number
-    or unrelated form field that happens to match the type/maxlength
-    fallbacks. Verifies via ``input_value()`` after fill.
+    input AND the value reads back as the code we wrote (some SPAs
+    intercept ``fill`` and only react to keyboard events).
     """
-    # Strategy 1: placeholder match (抖音 uses "请输入验证码").
-    placeholder_loc = page.get_by_placeholder("请输入验证码").first
-    candidates = [placeholder_loc]
+    candidates = []
 
-    # Strategy 2: label-anchored — text "短信已发送至" is the input page
-    # header; the actual input is its sibling/descendant. Covers the
-    # case where placeholder text gets refactored.
+    # Strategy 1: placeholder match — the literal placeholder 抖音 uses.
+    # get_by_placeholder is robust against deep DOM nesting.
+    for ph in ("请输入验证码", "验证码", "请输入"):
+        try:
+            loc = page.get_by_placeholder(ph).first
+            if await loc.count() > 0:
+                candidates.append(loc)
+        except Exception:
+            pass
+
+    # Strategy 2: Semi Design wrapper. 抖音's UI lib wraps every input in
+    # a div.semi-input-wrapper containing an actual <input>; the wrapper
+    # is what's styled, but locator(css ' input') works on the inner
+    # element for fill/click.
     try:
-        if await page.get_by_text("短信已发送至").count() > 0:
-            # The input lives in the same dialog — find the first visible
-            # input element on the page. Visible filter avoids hidden
-            # honeypots / phone-number fields.
-            visible_input = page.locator("input:visible").first
-            candidates.append(visible_input)
+        semi_input = page.locator(".semi-input-wrapper input").first
+        if await semi_input.count() > 0:
+            candidates.append(semi_input)
+    except Exception:
+        pass
+    # Direct input.semi-input is also a thing on older flows.
+    try:
+        loc = page.locator("input.semi-input").first
+        if await loc.count() > 0:
+            candidates.append(loc)
     except Exception:
         pass
 
-    # Strategy 3: legacy type/maxlength fallback for non-douyin platforms.
-    candidates.extend([
-        page.locator('input[type="tel"][maxlength="6"]').first,
-        page.locator('input[type="text"][maxlength="6"]').first,
-    ])
+    # Strategy 3: label-anchored — the text "短信已发送至 ***" is on the
+    # same dialog as the input; first visible <input> after that label.
+    try:
+        if await page.get_by_text("短信已发送至").count() > 0:
+            visible_input = page.locator("input:visible").first
+            if await visible_input.count() > 0:
+                candidates.append(visible_input)
+    except Exception:
+        pass
 
-    for loc in candidates:
+    # Strategy 4: legacy type/maxlength fallback for non-抖音 platforms.
+    for sel in (
+        'input[type="tel"][maxlength="6"]',
+        'input[type="text"][maxlength="6"]',
+        'input[type="number"]',
+    ):
         try:
-            if await loc.count() == 0:
-                continue
+            loc = page.locator(sel).first
+            if await loc.count() > 0:
+                candidates.append(loc)
+        except Exception:
+            pass
+
+    if not candidates:
+        logger.warning("SMS fill: no candidate input found on page")
+        return False
+
+    for i, loc in enumerate(candidates):
+        try:
             if not await loc.is_visible():
+                logger.debug("SMS fill candidate %d not visible", i)
                 continue
             await loc.scroll_into_view_if_needed(timeout=2000)
-            await loc.click(timeout=2000)  # focus first so SPA registers input
+            # Focus first so the SPA's onChange wires actually receive
+            # the value. Click at the input itself, not its wrapper.
+            await loc.click(timeout=2000)
+            # Two-pass strategy: try fast ``fill`` first; if value didn't
+            # persist, fall back to per-character ``page.keyboard.type``
+            # which triggers real ``input`` / ``keydown`` events the SPA
+            # is listening for.
             await loc.fill(code, timeout=3000)
-            # Verify the value really landed (some SPAs intercept fill).
-            actual = await loc.input_value(timeout=2000)
-            if actual.strip() == code:
-                logger.info("SMS code filled successfully (length=%d)", len(code))
+            actual = (await loc.input_value(timeout=2000)).strip()
+            if actual == code:
+                logger.info(
+                    "SMS code filled via fill() candidate=%d length=%d",
+                    i, len(code),
+                )
+                return True
+            # SPA swallowed the fill — try keyboard.type which dispatches
+            # real input events. Clear first so we don't append.
+            await loc.fill("", timeout=2000)
+            await loc.click(timeout=2000)
+            await page.keyboard.type(code, delay=80)
+            actual = (await loc.input_value(timeout=2000)).strip()
+            if actual == code:
+                logger.info(
+                    "SMS code filled via keyboard.type() candidate=%d length=%d",
+                    i, len(code),
+                )
                 return True
             logger.warning(
-                "SMS code fill verification failed: wrote %r, read %r",
-                code,
-                actual,
+                "SMS code fill verification failed for candidate %d: wrote %r, read %r",
+                i, code, actual,
             )
         except Exception:
-            logger.debug("fill attempt failed", exc_info=True)
+            logger.debug("fill attempt %d failed", i, exc_info=True)
     return False
 
 
 async def _click_sms_submit(page) -> bool:
     """Click the「验证」/ submit button on the SMS input page.
 
-    抖音's submit button shows the literal text "验证". Like the chooser
-    row, it's a deeply-nested element where CSS ``button:has-text``
-    misses. Use ``get_by_role`` (covers <button>) first, then text-engine
-    + ancestor walk (covers <div role=button> and friends).
-
-    Important: the button is disabled until the user has entered enough
-    digits — we just clicked fill, so it should be enabled by the time
-    we get here, but use ``trial=True`` semantics by inspecting
-    ``is_enabled()`` first to give a useful log line if it's not.
+    抖音's submit button shows the literal text "验证" but is wrapped in
+    Semi Design ``button.semi-button`` markup. CSS ``button:has-text``
+    misses when the visible label is in a nested span. We try every
+    strategy that's known to find buttons on Semi-styled pages.
     """
     candidates = []
-    # Strategy 1: ARIA role match — most semantic, works for real <button>.
+
+    # Strategy 1: ARIA role match — works for real <button> elements.
     try:
         role_loc = page.get_by_role("button", name="验证", exact=True).first
         if await role_loc.count() > 0:
@@ -291,7 +377,17 @@ async def _click_sms_submit(page) -> bool:
     except Exception:
         pass
 
-    # Strategy 2: text-engine + ancestor walk for non-button clickable.
+    # Strategy 2: Semi Design button — has class semi-button or
+    # semi-button-primary. Filter by visible "验证" text inside.
+    for class_sel in ("button.semi-button", "button.semi-button-primary"):
+        try:
+            loc = page.locator(f'{class_sel}:has-text("验证")').first
+            if await loc.count() > 0:
+                candidates.append(loc)
+        except Exception:
+            pass
+
+    # Strategy 3: text-engine + ancestor walk for div-based "buttons".
     # exact=True so we don't match "验证码" / "验证方式" / "验证失败" etc.
     try:
         text_loc = page.get_by_text("验证", exact=True).first
@@ -309,7 +405,24 @@ async def _click_sms_submit(page) -> bool:
     except Exception:
         pass
 
-    # Strategy 3: legacy CSS fallbacks for other platforms.
+    # Strategy 4: any visible button on the page — last-resort sweep.
+    # Pairs with the assumption that the SMS input dialog only has 2
+    # buttons ("取消" + "验证") and we filter by visible text.
+    try:
+        buttons = page.locator("button:visible")
+        n = await buttons.count()
+        for j in range(min(n, 10)):
+            btn = buttons.nth(j)
+            try:
+                txt = (await btn.inner_text()).strip()
+                if txt == "验证":
+                    candidates.append(btn)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Strategy 5: legacy CSS fallbacks for other platforms.
     for sel in (
         'button:has-text("下一步")',
         'button:has-text("确定")',
@@ -323,9 +436,14 @@ async def _click_sms_submit(page) -> bool:
         except Exception:
             pass
 
+    if not candidates:
+        logger.warning("SMS submit: no candidate button found on page")
+        return False
+
     for i, loc in enumerate(candidates):
         try:
             if not await loc.is_visible():
+                logger.debug("SMS submit candidate %d not visible", i)
                 continue
             try:
                 if not await loc.is_enabled():
@@ -344,6 +462,10 @@ async def _click_sms_submit(page) -> bool:
             return True
         except Exception:
             logger.debug("submit click attempt %d failed", i, exc_info=True)
+    logger.warning(
+        "SMS submit: %d candidates tried, none clicked successfully",
+        len(candidates),
+    )
     return False
 
 
@@ -429,6 +551,7 @@ async def perform_sms_action(page, action: ChallengeAction) -> dict[str, Any]:
             return {"ok": False, "detail": "验证码格式不合法"}
         filled = await _fill_sms_code(page, code)
         if not filled:
+            await _dump_page_for_debug(page, "sms_fill_failed")
             return {"ok": False, "detail": "未找到验证码输入框，或填入后值未保留"}
         # Brief pause: 抖音's submit button is bound to the input's
         # validity state, which their code re-evaluates on the next tick.
@@ -440,6 +563,8 @@ async def perform_sms_action(page, action: ChallengeAction) -> dict[str, Any]:
         except Exception:
             pass
         clicked = await _click_sms_submit(page)
+        if not clicked:
+            await _dump_page_for_debug(page, "sms_submit_failed")
         return {
             "ok": clicked,
             "detail": "验证码已提交" if clicked else "验证码已填入但未点到验证按钮（可能仍是禁用状态）",
