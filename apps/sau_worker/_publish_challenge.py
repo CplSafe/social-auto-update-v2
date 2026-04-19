@@ -140,27 +140,28 @@ async def _detect_sms_step(page) -> Literal["chooser", "input"] | None:
                         '#uc-second-verify, article, [role="dialog"], div'
                     )].some(el => el.innerText && el.innerText.includes('接收短信验证码'));
                     if (!hasTitle) return 'none';
-                    // Input page has a code input field. Chooser page doesn't.
                     const hasInput = !!(
                         document.querySelector('#button-input') ||
                         document.querySelector('input[placeholder*="验证码"]') ||
                         document.querySelector('input[name="button-input"]')
                     );
-                    if (hasInput) return 'input';
-                    // No input field but title present → chooser page.
-                    // (chooser has list rows like uc_verification_component_list_item)
                     const chooserRows = document.querySelectorAll(
                         '[class*="uc_verification_component_list_item"]'
                     );
-                    if (chooserRows.length > 0) return 'chooser';
-                    return 'chooser';
+                    // DEBUG: pack diagnostics into the return
+                    const diag = `hasTitle=${hasTitle} hasInput=${hasInput} rows=${chooserRows.length}`;
+                    if (chooserRows.length >= 2) return 'chooser:' + diag;
+                    if (hasInput) return 'input:' + diag;
+                    if (chooserRows.length > 0) return 'chooser:' + diag;
+                    return 'input:' + diag;
                 }"""
             )
-            if probe == "input":
-                logger.info("SMS challenge detected: step=input (via JS probe)")
+            logger.info("SMS detect probe raw=%r", probe)
+            if probe.startswith("input"):
+                logger.info("SMS challenge detected: step=input (%s)", probe)
                 return "input"
-            if probe == "chooser":
-                logger.info("SMS challenge detected: step=chooser (via JS probe)")
+            if probe.startswith("chooser"):
+                logger.info("SMS challenge detected: step=chooser (%s)", probe)
                 return "chooser"
         except Exception:
             logger.debug("JS title probe failed", exc_info=True)
